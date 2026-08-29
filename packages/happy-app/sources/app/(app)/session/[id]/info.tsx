@@ -11,7 +11,16 @@ import { useSession, useIsDataReady, useSessionProjectAvatar } from '@/sync/stor
 import { getSessionName, useSessionStatus, formatOSPlatform, formatPathRelativeToHome, getSessionAvatarId, getResumeCommand } from '@/utils/sessionUtils';
 import * as Clipboard from 'expo-clipboard';
 import { Modal } from '@/modal';
-import { sessionArchive, sessionKill, sessionDelete } from '@/sync/ops';
+import {
+    codexArchiveThread,
+    codexDeleteThread,
+    codexRenameThread,
+    codexUnarchiveThread,
+    sessionArchive,
+    sessionKill,
+    sessionDelete,
+} from '@/sync/ops';
+import { sync } from '@/sync/sync';
 import { maybeCleanupWorktree } from '@/hooks/useWorktreeCleanup';
 import { useUnistyles } from 'react-native-unistyles';
 import { layout } from '@/components/layout';
@@ -133,6 +142,9 @@ function SessionInfoContent({ session }: { session: Session }) {
     const devModeEnabled = __DEV__;
     const sessionName = getSessionName(session);
     const sessionStatus = useSessionStatus(session);
+    const isCatalogCodex = session.metadata?.codexCatalogManaged === true
+        && !!session.metadata.machineId
+        && !!session.metadata.codexThreadId;
     const {
         canShowResume,
         canFork,
@@ -166,6 +178,10 @@ function SessionInfoContent({ session }: { session: Session }) {
 
     // Use HappyAction for archiving - it handles errors automatically
     const [archivingSession, performArchive] = useHappyAction(async () => {
+        if (isCatalogCodex) {
+            const result = await codexArchiveThread(session.metadata!.machineId!, session.metadata!.codexThreadId!);
+            if (result.type !== 'success') throw new HappyError(result.errorMessage, false);
+        }
         // Prompt for worktree cleanup before killing (needs an active machine connection)
         await maybeCleanupWorktree(session.id, session.metadata?.path, session.metadata?.machineId);
 
@@ -185,6 +201,10 @@ function SessionInfoContent({ session }: { session: Session }) {
 
     // Use HappyAction for deletion - kills session first if needed, then deletes
     const [deletingSession, performDelete] = useHappyAction(async () => {
+        if (isCatalogCodex) {
+            const result = await codexDeleteThread(session.metadata!.machineId!, session.metadata!.codexThreadId!);
+            if (result.type !== 'success') throw new HappyError(result.errorMessage, false);
+        }
         // Prompt for worktree cleanup before killing (needs an active machine connection)
         await maybeCleanupWorktree(session.id, session.metadata?.path, session.metadata?.machineId);
 
@@ -217,6 +237,33 @@ function SessionInfoContent({ session }: { session: Session }) {
             ]
         );
     }, [performDelete]);
+
+    const [renamingCodexSession, performRenameCodexSession] = useHappyAction(async () => {
+        if (!isCatalogCodex) return;
+        const name = await Modal.prompt(
+            'Rename Codex Session',
+            'This changes the title in both Codex and Happy.',
+            { defaultValue: sessionName, placeholder: 'Session name', confirmText: t('common.rename') },
+        );
+        if (name === null || !name.trim()) return;
+        const result = await codexRenameThread(
+            session.metadata!.machineId!,
+            session.metadata!.codexThreadId!,
+            name.trim(),
+        );
+        if (result.type !== 'success') throw new HappyError(result.errorMessage, false);
+        await sync.refreshSessions();
+    });
+
+    const [unarchivingCodexSession, performUnarchiveCodexSession] = useHappyAction(async () => {
+        if (!isCatalogCodex) return;
+        const result = await codexUnarchiveThread(
+            session.metadata!.machineId!,
+            session.metadata!.codexThreadId!,
+        );
+        if (result.type !== 'success') throw new HappyError(result.errorMessage, false);
+        await sync.refreshSessions();
+    });
 
     const formatDate = useCallback((timestamp: number) => {
         return new Date(timestamp).toLocaleString();
@@ -420,12 +467,31 @@ function SessionInfoContent({ session }: { session: Session }) {
                             onPress={() => router.push(`/session/${session.metadata!.parentSessionId}`)}
                         />
                     )}
-                    <Item
-                        title={t('sessionInfo.archiveSession')}
-                        subtitle={t('sessionInfo.archiveSessionSubtitle')}
-                        icon={<Ionicons name="archive-outline" size={29} color="#FF3B30" />}
-                        onPress={handleArchiveSession}
-                    />
+                    {isCatalogCodex && (
+                        <Item
+                            title="Rename Codex Session"
+                            subtitle="Sync the title to Codex and Happy"
+                            icon={<Ionicons name="pencil-outline" size={29} color="#007AFF" />}
+                            onPress={performRenameCodexSession}
+                            loading={renamingCodexSession}
+                        />
+                    )}
+                    {isCatalogCodex && session.metadata?.codexProviderArchived ? (
+                        <Item
+                            title="Unarchive Codex Session"
+                            subtitle="Restore this session in Codex and Happy"
+                            icon={<Ionicons name="arrow-undo-outline" size={29} color="#007AFF" />}
+                            onPress={performUnarchiveCodexSession}
+                            loading={unarchivingCodexSession}
+                        />
+                    ) : (
+                        <Item
+                            title={t('sessionInfo.archiveSession')}
+                            subtitle={t('sessionInfo.archiveSessionSubtitle')}
+                            icon={<Ionicons name="archive-outline" size={29} color="#FF3B30" />}
+                            onPress={handleArchiveSession}
+                        />
+                    )}
                     <Item
                         title={t('sessionInfo.deleteSession')}
                         subtitle={t('sessionInfo.deleteSessionSubtitle')}

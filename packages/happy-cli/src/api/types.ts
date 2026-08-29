@@ -316,6 +316,16 @@ export type Metadata = {
   gitBranch?: string,
   claudeSessionId?: string, // Claude Code session ID
   codexThreadId?: string, // Codex app-server thread ID
+  /** True when the daemon mirrors this provider thread even while no runner is attached. */
+  codexCatalogManaged?: boolean,
+  /** Hash of CODEX_HOME used to keep independent local catalogs isolated. */
+  codexCatalogNamespace?: string,
+  /** Mirrors Codex's provider-side archive state. */
+  codexProviderArchived?: boolean,
+  codexUpdatedAt?: number,
+  /** Provider updatedAt value whose full history was durably uploaded. */
+  codexBackfilledUpdatedAt?: number,
+  codexSource?: string,
   tools?: string[],
   slashCommands?: string[],
   mcpServers?: Array<{ name: string; status: string }>,

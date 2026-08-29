@@ -38,6 +38,21 @@ function wrapHappySystem(text: string): string {
     return `${HAPPY_SYSTEM_BLOCK_OPEN}\n${text}\n${HAPPY_SYSTEM_BLOCK_CLOSE}`;
 }
 
+export function buildCodexDeveloperInstructions(opts: {
+    mode: Pick<CodexEnhancedMode, 'appendSystemPrompt'>;
+    includeAppendSystemPrompt: boolean;
+    includeTitleInstruction: boolean;
+}): string | undefined {
+    const parts: string[] = [];
+    if (opts.includeAppendSystemPrompt && opts.mode.appendSystemPrompt) {
+        parts.push(opts.mode.appendSystemPrompt);
+    }
+    if (opts.includeTitleInstruction) {
+        parts.push(CHANGE_TITLE_INSTRUCTION);
+    }
+    return parts.length > 0 ? parts.join('\n\n') : undefined;
+}
+
 /**
  * Remove any `<happy-system>…</happy-system>` blocks (and the blank lines that
  * join them to the user's text) from a Codex turn string, leaving only what the

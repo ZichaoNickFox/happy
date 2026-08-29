@@ -102,12 +102,57 @@ export type ThreadTurn = {
 
 export type Thread = {
     id: ThreadId;
+    sessionId?: string;
     forkedFromId?: string | null;
+    parentThreadId?: string | null;
+    preview?: string;
+    ephemeral?: boolean;
+    modelProvider?: string;
+    createdAt?: number;
+    updatedAt?: number;
+    recencyAt?: number | null;
+    status?: { type?: string; [key: string]: unknown };
     path?: string | null;
     cwd?: string;
+    source?: string | Record<string, unknown>;
+    name?: string | null;
     turns?: ThreadTurn[];
     [key: string]: unknown;
 };
+
+export type ThreadSourceKind =
+    | 'cli'
+    | 'vscode'
+    | 'exec'
+    | 'appServer'
+    | 'subAgent'
+    | 'subAgentReview'
+    | 'subAgentCompact'
+    | 'subAgentThreadSpawn'
+    | 'subAgentOther'
+    | 'unknown';
+
+export type ThreadListParams = {
+    cursor?: string | null;
+    limit?: number | null;
+    sortKey?: 'created_at' | 'updated_at' | 'recency_at' | 'section_position' | null;
+    sortDirection?: 'asc' | 'desc' | null;
+    modelProviders?: string[] | null;
+    sourceKinds?: ThreadSourceKind[] | null;
+    archived?: boolean | null;
+    sectionId?: string | null;
+    cwd?: string | string[] | null;
+    useStateDbOnly?: boolean;
+    searchTerm?: string | null;
+};
+
+export type ThreadListResponse = {
+    data: Thread[];
+    nextCursor: string | null;
+    backwardsCursor: string | null;
+};
+
+export type ThreadMutationResponse = Record<string, never>;
 
 export type ThreadGoalStatus = "active" | "paused" | "blocked" | "usageLimited" | "budgetLimited" | "complete";
 

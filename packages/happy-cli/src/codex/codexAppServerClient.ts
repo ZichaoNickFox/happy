@@ -13,7 +13,11 @@
  * app-server wrapper or approval callbacks. See docs/plans/codex-app-server-migration.md.
  */
 
-import { execSync, type ChildProcess } from 'node:child_process';
+import { execFileSync, type ChildProcess } from 'node:child_process';
+import { createHash } from 'node:crypto';
+import { readFileSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 import { spawn as crossSpawn } from 'cross-spawn';
 import { createInterface, type Interface as ReadlineInterface } from 'node:readline';
 import { logger } from '@/ui/logger';
@@ -36,6 +40,9 @@ import type {
     ThreadGoalClearParams,
     ThreadGoalClearResponse,
     Thread,
+    ThreadListParams,
+    ThreadListResponse,
+    ThreadMutationResponse,
     InterruptConversationParams,
     ReviewDecision,
     EventMsg,
@@ -48,6 +55,7 @@ import type {
     McpServerElicitationRequestResponse,
 } from './codexAppServerTypes';
 import type { SandboxConfig } from '@/persistence';
+import { resolveCodexExecutable } from '@/codex/codexExecutable';
 import { initializeSandbox, wrapForMcpTransport } from '@/sandbox/manager';
 import packageJson from '../../package.json';
 
@@ -56,6 +64,11 @@ type PendingRequest = {
     reject: (error: Error) => void;
     method: string;
     epoch: number;
+};
+
+type TurnCompletion = {
+    aborted: boolean;
+    event?: EventMsg;
 };
 
 type LegacyPatchChanges = Record<string, Record<string, unknown>>;
@@ -79,6 +92,52 @@ export type ApprovalHandler = (params: {
 
 function stringOrNull(value: unknown): string | null {
     return typeof value === 'string' && value.length > 0 ? value : null;
+}
+
+function isCodexAuthenticationFailure(event: EventMsg | undefined): boolean {
+    if (!event || (event.type !== 'task_complete' && event.type !== 'turn_aborted')) {
+        return false;
+    }
+
+    const error = event.error;
+    if (!error || typeof error !== 'object' || Array.isArray(error)) {
+        return false;
+    }
+
+    const errorRecord = error as Record<string, unknown>;
+    if (errorRecord.codexErrorInfo === 'unauthorized') {
+        return true;
+    }
+
+    const message = typeof errorRecord.message === 'string'
+        ? errorRecord.message.toLowerCase()
+        : '';
+    return message.includes('access token could not be refreshed')
+        || (message.includes('signed in to another account') && message.includes('sign in again'));
+}
+
+function readCodexAuthIdentity(): string | null {
+    try {
+        const codexHome = process.env.CODEX_HOME || join(homedir(), '.codex');
+        const auth = JSON.parse(readFileSync(join(codexHome, 'auth.json'), 'utf8')) as Record<string, unknown>;
+        const tokens = auth.tokens && typeof auth.tokens === 'object' && !Array.isArray(auth.tokens)
+            ? auth.tokens as Record<string, unknown>
+            : {};
+        const accountId = typeof tokens.account_id === 'string'
+            ? tokens.account_id
+            : (typeof auth.account_id === 'string' ? auth.account_id : '');
+        const refreshToken = typeof tokens.refresh_token === 'string' ? tokens.refresh_token : '';
+        const apiKey = typeof auth.OPENAI_API_KEY === 'string' ? auth.OPENAI_API_KEY : '';
+        const secret = refreshToken || apiKey;
+        const secretFingerprint = secret
+            ? createHash('sha256').update(secret).digest('hex')
+            : '';
+        const authMode = typeof auth.auth_mode === 'string' ? auth.auth_mode : '';
+        const identity = [authMode, accountId, secretFingerprint].join(':');
+        return identity === '::' ? null : identity;
+    } catch {
+        return null;
+    }
 }
 
 // Codex item ids are per-thread counters, so items from collab subagent
@@ -105,17 +164,20 @@ function parseCodexCliVersion(version: string): { major: number; minor: number; 
     return { major, minor, patch };
 }
 
-function readCodexCliVersion(): { major: number; minor: number; patch: number } | null {
+function readCodexCliVersion(codexExecutable: string): { major: number; minor: number; patch: number } | null {
     try {
-        const version = execSync('codex --version', { encoding: 'utf8', windowsHide: true }).trim();
+        const version = execFileSync(codexExecutable, ['--version'], {
+            encoding: 'utf8',
+            windowsHide: true,
+        }).trim();
         return parseCodexCliVersion(version);
     } catch {
         return null;
     }
 }
 
-function isAppServerAvailable(): boolean {
-    const version = readCodexCliVersion();
+function isAppServerAvailable(codexExecutable: string): boolean {
+    const version = readCodexCliVersion(codexExecutable);
     if (!version) {
         return false;
     }
@@ -124,8 +186,8 @@ function isAppServerAvailable(): boolean {
     return major > 0 || minor >= 100;
 }
 
-function isGoalActionsAvailable(): boolean {
-    const version = readCodexCliVersion();
+function isGoalActionsAvailable(codexExecutable: string): boolean {
+    const version = readCodexCliVersion(codexExecutable);
     if (!version) {
         return false;
     }
@@ -217,6 +279,7 @@ export class CodexAppServerClient {
     private pending = new Map<number, PendingRequest>();
     private processEpoch = 0;
     private connected = false;
+    private authIdentityAtConnect: string | null = null;
     private sandboxConfig?: SandboxConfig;
     private sandboxCleanup: (() => Promise<void>) | null = null;
     public sandboxEnabled = false;
@@ -230,12 +293,13 @@ export class CodexAppServerClient {
         approvalPolicy?: ApprovalPolicy;
         sandbox?: SandboxMode;
         mcpServers?: Record<string, unknown>;
+        developerInstructions?: string;
     } | null = null;
 
     // Turn completion tracking for the currently active sendTurnAndWait call.
     // A completion event only resolves once we have seen task_started for this turn.
     private pendingTurnCompletion: {
-        resolve: (aborted: boolean) => void;
+        resolve: (completion: TurnCompletion) => void;
         turnId: string | null;
     } | null = null;
 
@@ -257,7 +321,10 @@ export class CodexAppServerClient {
     private eventHandler: ((msg: EventMsg) => void) | null = null;
     private approvalHandler: ApprovalHandler | null = null;
 
-    constructor(sandboxConfig?: SandboxConfig) {
+    constructor(
+        sandboxConfig?: SandboxConfig,
+        private readonly codexExecutable = resolveCodexExecutable(),
+    ) {
         this.sandboxConfig = sandboxConfig;
     }
 
@@ -269,8 +336,12 @@ export class CodexAppServerClient {
         return this._turnId;
     }
 
+    isConnected(): boolean {
+        return this.connected;
+    }
+
     supportsGoalActions(): boolean {
-        return isGoalActionsAvailable();
+        return isGoalActionsAvailable(this.codexExecutable);
     }
 
     setEventHandler(handler: (msg: EventMsg) => void): void {
@@ -324,7 +395,23 @@ export class CodexAppServerClient {
     ): void {
         const aborted = status === 'cancelled' || status === 'canceled' || status === 'aborted' || status === 'interrupted';
 
-        this.tryResolvePendingTurn(aborted, turnId, source);
+        const completionEvent = (aborted
+            ? {
+                type: 'turn_aborted',
+                ...(turnId ? { turn_id: turnId } : {}),
+                ...(status ? { status } : {}),
+                ...(error !== undefined && error !== null ? { error } : {}),
+            }
+            : {
+                type: 'task_complete',
+                ...(turnId ? { turn_id: turnId } : {}),
+                ...(status ? { status } : {}),
+                ...(error !== undefined && error !== null ? { error } : {}),
+            }) as EventMsg;
+
+        const recoveringAuthentication = this.pendingTurnCompletion !== null
+            && isCodexAuthenticationFailure(completionEvent);
+        this.tryResolvePendingTurn(aborted, turnId, source, completionEvent);
         this._turnId = null;
 
         if (turnId && this.completedTurnIds.has(turnId)) {
@@ -334,22 +421,16 @@ export class CodexAppServerClient {
             this.completedTurnIds.add(turnId);
         }
 
-        if (aborted) {
-            this.eventHandler?.({
-                type: 'turn_aborted',
-                ...(turnId ? { turn_id: turnId } : {}),
-                ...(status ? { status } : {}),
-                ...(error !== undefined && error !== null ? { error } : {}),
-            });
+        // A stale app-server keeps the account token it was started with. If
+        // another Codex client logs into a different account, the next turn
+        // fails with `codexErrorInfo: unauthorized`. Hold that transient
+        // completion back while sendTurnAndWait restarts the app-server,
+        // resumes this same thread, and retries the prompt once.
+        if (recoveringAuthentication) {
             return;
         }
 
-        this.eventHandler?.({
-            type: 'task_complete',
-            ...(turnId ? { turn_id: turnId } : {}),
-            ...(status ? { status } : {}),
-            ...(error !== undefined && error !== null ? { error } : {}),
-        });
+        this.eventHandler?.(completionEvent);
     }
 
     private handleRawNotification(method: string, params: any): boolean {
@@ -595,7 +676,7 @@ export class CodexAppServerClient {
     async connect(): Promise<void> {
         if (this.connected) return;
 
-        if (!isAppServerAvailable()) {
+        if (!isAppServerAvailable(this.codexExecutable)) {
             throw new Error(
                 'Codex CLI is not installed\n\n' +
                 'Please install Codex CLI using one of these methods:\n\n' +
@@ -605,14 +686,14 @@ export class CodexAppServerClient {
             );
         }
 
-        let command = 'codex';
+        let command = this.codexExecutable;
         let args = ['app-server', '--listen', 'stdio://'];
         this.sandboxEnabled = false;
 
         if (this.sandboxConfig?.enabled && process.platform !== 'win32') {
             try {
                 this.sandboxCleanup = await initializeSandbox(this.sandboxConfig, process.cwd());
-                const wrapped = await wrapForMcpTransport('codex', ['app-server', '--listen', 'stdio://']);
+                const wrapped = await wrapForMcpTransport(this.codexExecutable, ['app-server', '--listen', 'stdio://']);
                 command = wrapped.command;
                 args = wrapped.args;
                 this.sandboxEnabled = true;
@@ -701,6 +782,7 @@ export class CodexAppServerClient {
         await this.request('initialize', initParams);
         this.notify('initialized');
         this.connected = true;
+        this.authIdentityAtConnect = readCodexAuthIdentity();
         logger.debug('[CodexAppServer] Connected and initialized');
     }
 
@@ -774,6 +856,7 @@ export class CodexAppServerClient {
         approvalPolicy?: ApprovalPolicy;
         sandbox?: SandboxMode;
         mcpServers?: Record<string, unknown>;
+        developerInstructions?: string;
     }): void {
         this.threadDefaults = {
             model: opts.model,
@@ -781,6 +864,7 @@ export class CodexAppServerClient {
             approvalPolicy: opts.approvalPolicy,
             sandbox: opts.sandbox,
             mcpServers: opts.mcpServers,
+            developerInstructions: opts.developerInstructions,
         };
     }
 
@@ -792,6 +876,7 @@ export class CodexAppServerClient {
         approvalPolicy?: ApprovalPolicy;
         sandbox?: SandboxMode;
         mcpServers?: Record<string, unknown>;
+        developerInstructions?: string;
     }): Promise<{ threadId: string; model: string }> {
         const params: NewConversationParams = {
             model: opts.model ?? null,
@@ -802,7 +887,7 @@ export class CodexAppServerClient {
             sandbox: opts.sandbox ?? null,
             config: this.buildThreadConfig(opts.mcpServers),
             baseInstructions: null,
-            developerInstructions: null,
+            developerInstructions: opts.developerInstructions ?? null,
             compactPrompt: null,
             includeApplyPatchTool: null,
             experimentalRawEvents: false,
@@ -825,6 +910,7 @@ export class CodexAppServerClient {
         approvalPolicy?: ApprovalPolicy;
         sandbox?: SandboxMode;
         mcpServers?: Record<string, unknown>;
+        developerInstructions?: string;
     }): Promise<{ threadId: string; model: string }> {
         const threadId = opts?.threadId ?? this._threadId;
         if (!threadId) {
@@ -841,7 +927,7 @@ export class CodexAppServerClient {
             sandbox: opts?.sandbox ?? defaults.sandbox ?? null,
             config: this.buildThreadConfig(opts?.mcpServers ?? defaults.mcpServers),
             baseInstructions: null,
-            developerInstructions: null,
+            developerInstructions: opts?.developerInstructions ?? defaults.developerInstructions ?? null,
             persistExtendedHistory: true,
         };
 
@@ -855,6 +941,7 @@ export class CodexAppServerClient {
             approvalPolicy: opts?.approvalPolicy ?? defaults.approvalPolicy,
             sandbox: opts?.sandbox ?? defaults.sandbox,
             mcpServers: opts?.mcpServers ?? defaults.mcpServers,
+            developerInstructions: opts?.developerInstructions ?? defaults.developerInstructions,
         });
         logger.debug('[CodexAppServer] Thread resumed:', this._threadId);
         return { threadId: result.thread.id, model: result.model };
@@ -867,6 +954,7 @@ export class CodexAppServerClient {
         approvalPolicy?: ApprovalPolicy;
         sandbox?: SandboxMode;
         mcpServers?: Record<string, unknown>;
+        developerInstructions?: string;
     }): Promise<{ threadId: string; model: string; thread: Thread }> {
         const defaults = this.threadDefaults ?? {};
         const params: ForkConversationParams = {
@@ -878,7 +966,7 @@ export class CodexAppServerClient {
             sandbox: opts.sandbox ?? defaults.sandbox ?? null,
             config: this.buildThreadConfig(opts.mcpServers ?? defaults.mcpServers),
             baseInstructions: null,
-            developerInstructions: null,
+            developerInstructions: opts.developerInstructions ?? defaults.developerInstructions ?? null,
             ephemeral: false,
             threadSource: null,
         };
@@ -892,6 +980,7 @@ export class CodexAppServerClient {
             approvalPolicy: opts.approvalPolicy ?? defaults.approvalPolicy,
             sandbox: opts.sandbox ?? defaults.sandbox,
             mcpServers: opts.mcpServers ?? defaults.mcpServers,
+            developerInstructions: opts.developerInstructions ?? defaults.developerInstructions,
         });
         logger.debug('[CodexAppServer] Thread forked:', opts.threadId, '->', this._threadId);
         return { threadId: result.thread.id, model: result.model, thread: result.thread };
@@ -906,6 +995,26 @@ export class CodexAppServerClient {
             includeTurns: opts.includeTurns ?? true,
         };
         return await this.request('thread/read', params) as ReadConversationResponse;
+    }
+
+    async listThreads(opts: ThreadListParams = {}): Promise<ThreadListResponse> {
+        return await this.request('thread/list', opts) as ThreadListResponse;
+    }
+
+    async setThreadName(opts: { threadId: string; name: string }): Promise<ThreadMutationResponse> {
+        return await this.request('thread/name/set', opts) as ThreadMutationResponse;
+    }
+
+    async archiveThread(opts: { threadId: string }): Promise<ThreadMutationResponse> {
+        return await this.request('thread/archive', opts) as ThreadMutationResponse;
+    }
+
+    async unarchiveThread(opts: { threadId: string }): Promise<ThreadMutationResponse> {
+        return await this.request('thread/unarchive', opts) as ThreadMutationResponse;
+    }
+
+    async deleteThread(opts: { threadId: string }): Promise<ThreadMutationResponse> {
+        return await this.request('thread/delete', opts) as ThreadMutationResponse;
     }
 
     async rollbackThread(opts: {
@@ -983,9 +1092,9 @@ export class CodexAppServerClient {
         return this.pendingTurnCompletion !== null;
     }
 
-    private resolvePendingTurn(aborted: boolean): void {
+    private resolvePendingTurn(aborted: boolean, event?: EventMsg): void {
         if (!this.pendingTurnCompletion) return;
-        this.pendingTurnCompletion.resolve(aborted);
+        this.pendingTurnCompletion.resolve({ aborted, event });
         this.pendingTurnCompletion = null;
     }
 
@@ -996,7 +1105,12 @@ export class CodexAppServerClient {
         }
     }
 
-    private tryResolvePendingTurn(aborted: boolean, turnId: string | null, source: string): void {
+    private tryResolvePendingTurn(
+        aborted: boolean,
+        turnId: string | null,
+        source: string,
+        event?: EventMsg,
+    ): void {
         const pending = this.pendingTurnCompletion;
         if (!pending) return;
 
@@ -1011,7 +1125,7 @@ export class CodexAppServerClient {
             return;
         }
 
-        this.resolvePendingTurn(aborted);
+        this.resolvePendingTurn(aborted, event);
     }
 
     private async waitForTurnCompletion(timeoutMs: number): Promise<boolean> {
@@ -1143,7 +1257,7 @@ export class CodexAppServerClient {
      * Send a user turn and wait for it to complete (task_complete or turn_aborted).
      * Returns { aborted: true } if the turn was aborted (user cancel, permission reject, etc.).
      */
-    async sendTurnAndWait(prompt: string, opts?: {
+    private async sendTurnAndWaitOnce(prompt: string, opts?: {
         model?: string;
         cwd?: string;
         approvalPolicy?: ApprovalPolicy;
@@ -1151,7 +1265,7 @@ export class CodexAppServerClient {
         effort?: ReasoningEffort;
         extraInputItems?: InputItem[];
         turnTimeoutMs?: number;
-    }): Promise<{ aborted: boolean }> {
+    }): Promise<TurnCompletion> {
         // Wait for any in-flight interruptTurn() to complete before starting a new
         // turn. Otherwise the stale turn/interrupt RPC can reach Codex after our
         // turn/start and abort the wrong turn.
@@ -1166,7 +1280,7 @@ export class CodexAppServerClient {
         const timeoutMs = opts?.turnTimeoutMs ?? CodexAppServerClient.TURN_TIMEOUT_MS;
         let timer: ReturnType<typeof setTimeout> | null = null;
 
-        const completion = new Promise<boolean>((resolve) => {
+        const completion = new Promise<TurnCompletion>((resolve) => {
             this.pendingTurnCompletion = {
                 resolve,
                 turnId: null,
@@ -1188,9 +1302,64 @@ export class CodexAppServerClient {
             throw err;
         }
 
-        const aborted = await completion;
+        const result = await completion;
         if (timer) clearTimeout(timer);
-        return { aborted };
+        return result;
+    }
+
+    private async reconnectIfCodexAuthChanged(): Promise<void> {
+        const currentIdentity = readCodexAuthIdentity();
+        if (!currentIdentity || currentIdentity === this.authIdentityAtConnect) {
+            return;
+        }
+
+        logger.warn('[CodexAppServer] Codex credentials changed; reconnecting before the next turn');
+        const hadThread = this._threadId !== null;
+        const resumed = await this.reconnectAndResumeThread();
+        if (hadThread && !resumed) {
+            throw new Error('Codex credentials changed, but the existing thread could not be resumed.');
+        }
+    }
+
+    /**
+     * Send a turn, transparently replacing a stale app-server after the user
+     * logs Codex into another account. The original thread and prompt are
+     * preserved, and the retry is capped at one to avoid loops when the new
+     * account itself is not authenticated.
+     */
+    async sendTurnAndWait(prompt: string, opts?: {
+        model?: string;
+        cwd?: string;
+        approvalPolicy?: ApprovalPolicy;
+        sandbox?: SandboxMode;
+        effort?: ReasoningEffort;
+        extraInputItems?: InputItem[];
+        turnTimeoutMs?: number;
+    }): Promise<{ aborted: boolean }> {
+        await this.reconnectIfCodexAuthChanged();
+        const first = await this.sendTurnAndWaitOnce(prompt, opts);
+        if (!isCodexAuthenticationFailure(first.event)) {
+            return { aborted: first.aborted };
+        }
+
+        logger.warn('[CodexAppServer] Codex account changed; restarting app-server and retrying the turn');
+        let resumed = false;
+        try {
+            resumed = await this.reconnectAndResumeThread();
+        } catch (error) {
+            logger.warn('[CodexAppServer] Failed to reconnect after Codex authentication changed', error);
+        }
+
+        if (!resumed) {
+            this.eventHandler?.(first.event!);
+            return { aborted: first.aborted };
+        }
+
+        const retry = await this.sendTurnAndWaitOnce(prompt, opts);
+        if (isCodexAuthenticationFailure(retry.event)) {
+            this.eventHandler?.(retry.event!);
+        }
+        return { aborted: retry.aborted };
     }
 
     async interruptTurn(opts?: { timeoutMs?: number }): Promise<void> {
@@ -1537,10 +1706,19 @@ export class CodexAppServerClient {
                 if (msg.type === 'task_started') {
                     this.markPendingTurnStarted(msg.turn_id ?? msg.turnId ?? null);
                 }
-                // Fire event handler first (so consumer processes the event)
-                this.eventHandler?.(msg);
+                const completionEvent = (msg.type === 'task_complete' || msg.type === 'turn_aborted')
+                    ? msg as EventMsg
+                    : undefined;
+                const recoveringAuthentication = this.pendingTurnCompletion !== null
+                    && isCodexAuthenticationFailure(completionEvent);
+                // Authentication failures are transient after an account
+                // switch. sendTurnAndWait reconnects and retries before the
+                // consumer sees a terminal error.
+                if (!recoveringAuthentication) {
+                    this.eventHandler?.(msg);
+                }
                 // Then resolve turn completion promise
-                if (msg.type === 'task_complete' || msg.type === 'turn_aborted') {
+                if (completionEvent) {
                     const turnId = msg.turn_id ?? msg.turnId ?? null;
                     // Mark as completed so v2 turn/completed doesn't duplicate
                     if (turnId) {
@@ -1550,6 +1728,7 @@ export class CodexAppServerClient {
                         msg.type === 'turn_aborted',
                         turnId,
                         `codex/event/${msg.type}`,
+                        completionEvent,
                     );
                     this._turnId = null;
                 }

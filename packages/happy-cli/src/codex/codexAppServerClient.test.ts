@@ -2,13 +2,13 @@ import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { SandboxConfig } from '@/persistence';
 
 const {
-    mockExecSync,
+    mockExecFileSync,
     mockInitializeSandbox,
     mockWrapForMcpTransport,
     mockSandboxCleanup,
     mockSpawn,
 } = vi.hoisted(() => ({
-    mockExecSync: vi.fn(),
+    mockExecFileSync: vi.fn(),
     mockInitializeSandbox: vi.fn(),
     mockWrapForMcpTransport: vi.fn(),
     mockSandboxCleanup: vi.fn(),
@@ -16,7 +16,7 @@ const {
 }));
 
 vi.mock('node:child_process', () => ({
-    execSync: mockExecSync,
+    execFileSync: mockExecFileSync,
     spawn: mockSpawn,
 }));
 
@@ -118,7 +118,7 @@ describe('CodexAppServerClient sandbox integration', () => {
     beforeEach(() => {
         vi.clearAllMocks();
         process.env.RUST_LOG = originalRustLog;
-        mockExecSync.mockReturnValue('codex-cli 0.107.0');
+        mockExecFileSync.mockReturnValue('codex-cli 0.107.0');
         mockInitializeSandbox.mockResolvedValue(mockSandboxCleanup);
         mockWrapForMcpTransport.mockResolvedValue({ command: 'sh', args: ['-c', 'wrapped codex app-server'] });
         mockSpawn.mockImplementation(() => createMockProcess());
@@ -131,17 +131,17 @@ describe('CodexAppServerClient sandbox integration', () => {
     it('reports goal action support for Codex versions with goal action requests', async () => {
         const { CodexAppServerClient } = await import('./codexAppServerClient');
 
-        mockExecSync.mockReturnValue('codex-cli 0.140.0');
+        mockExecFileSync.mockReturnValue('codex-cli 0.140.0');
         expect(new CodexAppServerClient().supportsGoalActions()).toBe(true);
 
-        mockExecSync.mockReturnValue('codex-cli 0.130.0');
+        mockExecFileSync.mockReturnValue('codex-cli 0.130.0');
         expect(new CodexAppServerClient().supportsGoalActions()).toBe(false);
     });
 
     it('wraps transport when sandbox is enabled', async () => {
         // Dynamic import to ensure mocks are applied
         const { CodexAppServerClient } = await import('./codexAppServerClient');
-        const client = new CodexAppServerClient(sandboxConfig);
+        const client = new CodexAppServerClient(sandboxConfig, 'codex');
 
         await client.connect();
 
@@ -165,7 +165,7 @@ describe('CodexAppServerClient sandbox integration', () => {
     it('falls back to non-sandbox transport when sandbox initialization fails', async () => {
         mockInitializeSandbox.mockRejectedValue(new Error('sandbox init failed'));
         const { CodexAppServerClient } = await import('./codexAppServerClient');
-        const client = new CodexAppServerClient(sandboxConfig);
+        const client = new CodexAppServerClient(sandboxConfig, 'codex');
 
         await client.connect();
 
@@ -373,6 +373,124 @@ describe('CodexAppServerClient sandbox integration', () => {
         expect(client.threadId).toBe('thread-1');
 
         await expect(client.sendTurnAndWait('follow up after reconnect')).resolves.toEqual({ aborted: false });
+
+        await client.disconnect();
+    });
+
+    it('restarts the app-server and retries the same turn after a Codex account switch', async () => {
+        const firstProcessRequests: MockRpcMessage[] = [];
+        const secondProcessRequests: MockRpcMessage[] = [];
+        const events: Array<Record<string, unknown>> = [];
+
+        const proc1 = createMockProcess({
+            pid: 2101,
+            onRequest: (msg, stdout) => {
+                firstProcessRequests.push(msg);
+                if (msg.method === 'thread/start' && msg.id != null) {
+                    setTimeout(() => {
+                        pushJsonLine(stdout, {
+                            id: msg.id,
+                            result: {
+                                thread: { id: 'thread-auth', path: '/tmp/thread-auth' },
+                                model: 'gpt-test',
+                            },
+                        });
+                    }, 0);
+                }
+                if (msg.method === 'turn/start' && msg.id != null) {
+                    setTimeout(() => {
+                        pushJsonLine(stdout, { id: msg.id, result: { turn: { id: 'turn-auth-old' } } });
+                        pushJsonLine(stdout, {
+                            method: 'codex/event',
+                            params: { msg: { type: 'task_started', turn_id: 'turn-auth-old' } },
+                        });
+                        pushJsonLine(stdout, {
+                            method: 'codex/event',
+                            params: {
+                                msg: {
+                                    type: 'task_complete',
+                                    turn_id: 'turn-auth-old',
+                                    status: 'failed',
+                                    error: {
+                                        message: 'Your access token could not be refreshed because you have since logged out or signed in to another account. Please sign in again.',
+                                        codexErrorInfo: 'unauthorized',
+                                    },
+                                },
+                            },
+                        });
+                    }, 0);
+                }
+            },
+        });
+
+        const proc2 = createMockProcess({
+            pid: 2102,
+            onRequest: (msg, stdout) => {
+                secondProcessRequests.push(msg);
+                if (msg.method === 'thread/resume' && msg.id != null) {
+                    setTimeout(() => {
+                        pushJsonLine(stdout, {
+                            id: msg.id,
+                            result: {
+                                thread: { id: 'thread-auth', path: '/tmp/thread-auth' },
+                                model: 'gpt-test',
+                            },
+                        });
+                    }, 0);
+                }
+                if (msg.method === 'turn/start' && msg.id != null) {
+                    setTimeout(() => {
+                        pushJsonLine(stdout, { id: msg.id, result: { turn: { id: 'turn-auth-new' } } });
+                        pushJsonLine(stdout, {
+                            method: 'codex/event',
+                            params: { msg: { type: 'task_started', turn_id: 'turn-auth-new' } },
+                        });
+                        pushJsonLine(stdout, {
+                            method: 'codex/event',
+                            params: { msg: { type: 'task_complete', turn_id: 'turn-auth-new' } },
+                        });
+                    }, 0);
+                }
+            },
+        });
+
+        mockSpawn
+            .mockImplementationOnce(() => proc1)
+            .mockImplementationOnce(() => proc2);
+
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        const client = new CodexAppServerClient();
+        client.setEventHandler((event) => events.push(event as Record<string, unknown>));
+
+        await client.connect();
+        await client.startThread({
+            model: 'gpt-test',
+            cwd: '/tmp/project',
+            approvalPolicy: 'never',
+            sandbox: 'danger-full-access',
+        });
+
+        await expect(client.sendTurnAndWait('continue the same work', {
+            model: 'gpt-test',
+            effort: 'high',
+        })).resolves.toEqual({ aborted: false });
+
+        expect(firstProcessRequests.filter((msg) => msg.method === 'turn/start')).toHaveLength(1);
+        expect(secondProcessRequests.filter((msg) => msg.method === 'thread/resume')).toHaveLength(1);
+        expect(secondProcessRequests.filter((msg) => msg.method === 'turn/start')).toHaveLength(1);
+        expect(secondProcessRequests.find((msg) => msg.method === 'turn/start')?.params).toEqual(
+            expect.objectContaining({
+                threadId: 'thread-auth',
+                input: [{ type: 'text', text: 'continue the same work' }],
+                model: 'gpt-test',
+                effort: 'high',
+            }),
+        );
+        expect(events.filter((event) => event.type === 'task_complete')).toEqual([
+            expect.objectContaining({ type: 'task_complete', turn_id: 'turn-auth-new' }),
+        ]);
+        expect(events.some((event) => (event.error as Record<string, unknown> | undefined)?.codexErrorInfo === 'unauthorized')).toBe(false);
+        expect(proc1.kill).toHaveBeenCalledWith('SIGTERM');
 
         await client.disconnect();
     });

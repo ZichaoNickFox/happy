@@ -138,6 +138,12 @@ export const MetadataSchema = z.object({
     machineId: z.string().optional(),
     claudeSessionId: z.string().optional(), // Claude Code session ID
     codexThreadId: z.string().optional(), // Codex app-server thread ID
+    codexCatalogManaged: z.boolean().optional(),
+    codexCatalogNamespace: z.string().optional(),
+    codexProviderArchived: z.boolean().optional(),
+    codexUpdatedAt: z.number().optional(),
+    codexBackfilledUpdatedAt: z.number().optional(),
+    codexSource: z.string().optional(),
     tools: z.array(z.string()).optional(),
     slashCommands: z.array(z.string()).optional(),
     mcpServers: z.array(z.object({ name: z.string(), status: z.string() })).optional(),

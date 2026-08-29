@@ -248,6 +248,28 @@ export type CodexListRewindPointsResult =
     | { type: 'success'; points: CodexRewindPoint[] }
     | { type: 'error'; errorMessage: string };
 
+export interface CodexCatalogThread {
+    threadId: string;
+    happySessionId: string;
+    name: string | null;
+    preview: string;
+    cwd: string;
+    archived: boolean;
+    createdAt: number;
+    updatedAt: number;
+    backfilledUpdatedAt: number | null;
+    source: string;
+    status: string;
+}
+
+type CodexCatalogListResult =
+    | { type: 'success'; threads: CodexCatalogThread[] }
+    | { type: 'error'; errorMessage: string };
+
+type CodexThreadMutationResult =
+    | { type: 'success' }
+    | { type: 'error'; errorMessage: string };
+
 export interface ResumeSessionOptions {
     machineId: string;
     sessionId: string;
@@ -340,6 +362,46 @@ export async function machineSpawnNewSession(options: SpawnSessionOptions): Prom
             errorMessage: error instanceof Error ? error.message : 'Failed to spawn session'
         };
     }
+}
+
+export async function codexCatalogSync(machineId: string): Promise<CodexCatalogListResult> {
+    try {
+        return await apiSocket.machineRPC<CodexCatalogListResult, Record<string, never>>(
+            machineId,
+            'codex-catalog-sync',
+            {},
+        );
+    } catch (error) {
+        return { type: 'error', errorMessage: error instanceof Error ? error.message : 'Failed to sync Codex sessions' };
+    }
+}
+
+async function codexThreadMutation(
+    machineId: string,
+    method: 'codex-thread-rename' | 'codex-thread-archive' | 'codex-thread-unarchive' | 'codex-thread-delete',
+    params: { threadId: string; name?: string },
+): Promise<CodexThreadMutationResult> {
+    try {
+        return await apiSocket.machineRPC<CodexThreadMutationResult, typeof params>(machineId, method, params);
+    } catch (error) {
+        return { type: 'error', errorMessage: error instanceof Error ? error.message : 'Codex operation failed' };
+    }
+}
+
+export function codexRenameThread(machineId: string, threadId: string, name: string) {
+    return codexThreadMutation(machineId, 'codex-thread-rename', { threadId, name });
+}
+
+export function codexArchiveThread(machineId: string, threadId: string) {
+    return codexThreadMutation(machineId, 'codex-thread-archive', { threadId });
+}
+
+export function codexUnarchiveThread(machineId: string, threadId: string) {
+    return codexThreadMutation(machineId, 'codex-thread-unarchive', { threadId });
+}
+
+export function codexDeleteThread(machineId: string, threadId: string) {
+    return codexThreadMutation(machineId, 'codex-thread-delete', { threadId });
 }
 
 /**

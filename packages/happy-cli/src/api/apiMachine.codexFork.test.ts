@@ -64,6 +64,44 @@ describe('ApiMachineClient Codex fork RPCs', () => {
         expect(codexClientMethods.disconnect).toHaveBeenCalledOnce();
     });
 
+    it('routes catalog list, sync, rename, archive, unarchive, and delete RPCs', async () => {
+        const codexCatalog = {
+            list: vi.fn(() => [{ threadId: 'thread-1' }]),
+            syncNow: vi.fn(async () => [{ threadId: 'thread-1' }]),
+            renameThread: vi.fn(async () => {}),
+            archiveThread: vi.fn(async () => {}),
+            unarchiveThread: vi.fn(async () => {}),
+            deleteThread: vi.fn(async () => {}),
+        };
+        const { ApiMachineClient } = await import('./apiMachine');
+        const client = new ApiMachineClient('token', machineClient());
+        client.setRPCHandlers({
+            spawnSession: vi.fn(),
+            stopSession: vi.fn(),
+            requestShutdown: vi.fn(),
+            codexCatalog: codexCatalog as any,
+        });
+        const handlers = handlersFrom(client);
+
+        await expect(handlers.get('machine-1:codex-catalog-list')?.({})).resolves.toEqual({
+            type: 'success',
+            threads: [{ threadId: 'thread-1' }],
+        });
+        await expect(handlers.get('machine-1:codex-catalog-sync')?.({})).resolves.toEqual({
+            type: 'success',
+            threads: [{ threadId: 'thread-1' }],
+        });
+        await handlers.get('machine-1:codex-thread-rename')?.({ threadId: 'thread-1', name: 'New' });
+        await handlers.get('machine-1:codex-thread-archive')?.({ threadId: 'thread-1' });
+        await handlers.get('machine-1:codex-thread-unarchive')?.({ threadId: 'thread-1' });
+        await handlers.get('machine-1:codex-thread-delete')?.({ threadId: 'thread-1' });
+
+        expect(codexCatalog.renameThread).toHaveBeenCalledWith('thread-1', 'New');
+        expect(codexCatalog.archiveThread).toHaveBeenCalledWith('thread-1');
+        expect(codexCatalog.unarchiveThread).toHaveBeenCalledWith('thread-1');
+        expect(codexCatalog.deleteThread).toHaveBeenCalledWith('thread-1');
+    });
+
     it('forwards resumeCodexThreadId through the spawn RPC', async () => {
         const spawnSession = vi.fn().mockResolvedValue({ type: 'success', sessionId: 'happy-forked' });
 

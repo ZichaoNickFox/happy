@@ -1131,20 +1131,7 @@ class Sync {
         if (!this.credentials) return;
 
         const API_ENDPOINT = getServerUrl();
-        const response = await fetch(`${API_ENDPOINT}/v1/sessions`, {
-            headers: {
-                'Authorization': `Bearer ${this.credentials.token}`,
-                'Content-Type': 'application/json',
-                'X-Happy-Client': getHappyClientId(),
-            }
-        });
-
-        if (!response.ok) {
-            throw new Error(`Failed to fetch sessions: ${response.status}`);
-        }
-
-        const data = await response.json();
-        const sessions = data.sessions as Array<{
+        type RawSession = {
             id: string;
             tag: string;
             seq: number;
@@ -1159,7 +1146,38 @@ class Sync {
             createdAt: number;
             updatedAt: number;
             lastMessage: ApiMessage | null;
-        }>;
+        };
+        const sessions: RawSession[] = [];
+        let cursor: string | null = null;
+        const seenCursors = new Set<string>();
+        do {
+            const url = new URL(`${API_ENDPOINT}/v2/sessions`);
+            url.searchParams.set('limit', '200');
+            if (cursor) url.searchParams.set('cursor', cursor);
+            const response = await fetch(url.toString(), {
+                headers: {
+                    'Authorization': `Bearer ${this.credentials.token}`,
+                    'Content-Type': 'application/json',
+                    'X-Happy-Client': getHappyClientId(),
+                }
+            });
+
+            if (!response.ok) {
+                throw new Error(`Failed to fetch sessions: ${response.status}`);
+            }
+
+            const data = await response.json() as {
+                sessions?: RawSession[];
+                nextCursor?: string | null;
+            };
+            sessions.push(...(data.sessions ?? []));
+            const nextCursor = data.nextCursor ?? null;
+            if (nextCursor && seenCursors.has(nextCursor)) {
+                throw new Error('Failed to fetch sessions: pagination cursor repeated');
+            }
+            if (nextCursor) seenCursors.add(nextCursor);
+            cursor = nextCursor;
+        } while (cursor);
 
         // Initialize all session encryptions first
         const sessionKeys = new Map<string, Uint8Array | null>();

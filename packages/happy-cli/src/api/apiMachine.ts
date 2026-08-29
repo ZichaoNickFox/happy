@@ -28,6 +28,7 @@ import {
     forkCodexThread,
     listCodexRewindPoints,
 } from '@/codex/codexThreadFork';
+import type { CodexSessionCatalog } from '@/codex/codexSessionCatalog';
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -93,6 +94,7 @@ type MachineRpcHandlers = {
     resumeSession?: (sessionId: string, options?: { model?: string; permissionMode?: string }) => Promise<SpawnSessionResult>;
     stopSession: (sessionId: string) => boolean;
     requestShutdown: () => void;
+    codexCatalog?: CodexSessionCatalog;
 }
 
 function requireNonEmptyString(value: unknown, name: string): string {
@@ -142,7 +144,8 @@ export class ApiMachineClient {
         spawnSession,
         resumeSession,
         stopSession,
-        requestShutdown
+        requestShutdown,
+        codexCatalog,
     }: MachineRpcHandlers) {
         this.resumeSessionHandler = resumeSession ?? null;
 
@@ -316,6 +319,43 @@ export class ApiMachineClient {
                 throw error;
             }
         });
+
+        if (codexCatalog) {
+            this.rpcHandlerManager.registerHandler('codex-catalog-list', async () => ({
+                type: 'success',
+                threads: codexCatalog.list(),
+            }));
+
+            this.rpcHandlerManager.registerHandler('codex-catalog-sync', async () => ({
+                type: 'success',
+                threads: await codexCatalog.syncNow(),
+            }));
+
+            this.rpcHandlerManager.registerHandler('codex-thread-rename', async (params: any) => {
+                const threadId = requireNonEmptyString(params?.threadId, 'threadId');
+                const name = requireNonEmptyString(params?.name, 'name');
+                await codexCatalog.renameThread(threadId, name);
+                return { type: 'success' };
+            });
+
+            this.rpcHandlerManager.registerHandler('codex-thread-archive', async (params: any) => {
+                const threadId = requireNonEmptyString(params?.threadId, 'threadId');
+                await codexCatalog.archiveThread(threadId);
+                return { type: 'success' };
+            });
+
+            this.rpcHandlerManager.registerHandler('codex-thread-unarchive', async (params: any) => {
+                const threadId = requireNonEmptyString(params?.threadId, 'threadId');
+                await codexCatalog.unarchiveThread(threadId);
+                return { type: 'success' };
+            });
+
+            this.rpcHandlerManager.registerHandler('codex-thread-delete', async (params: any) => {
+                const threadId = requireNonEmptyString(params?.threadId, 'threadId');
+                await codexCatalog.deleteThread(threadId);
+                return { type: 'success' };
+            });
+        }
 
         // Register stop daemon handler
         this.rpcHandlerManager.registerHandler('stop-daemon', () => {

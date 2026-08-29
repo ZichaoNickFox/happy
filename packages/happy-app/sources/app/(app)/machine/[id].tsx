@@ -8,9 +8,9 @@ import { Typography } from '@/constants/Typography';
 import { useSessions, useAllMachines, useMachine } from '@/sync/storage';
 import { Ionicons, Octicons } from '@expo/vector-icons';
 import type { Session } from '@/sync/storageTypes';
-import { machineStopDaemon, machineUpdateMetadata, machineDelete } from '@/sync/ops';
+import { codexCatalogSync, machineStopDaemon, machineUpdateMetadata, machineDelete } from '@/sync/ops';
 import { Modal } from '@/modal';
-import { getSessionName, getSessionSubtitle } from '@/utils/sessionUtils';
+import { formatPathRelativeToHome, getSessionName, getSessionSubtitle } from '@/utils/sessionUtils';
 import { isMachineOnline } from '@/utils/machineUtils';
 import { sync } from '@/sync/sync';
 import { useUnistyles } from 'react-native-unistyles';
@@ -40,8 +40,28 @@ export default function MachineDetailScreen() {
         }) as Session[];
     }, [sessions, machineId]);
 
+    const codexSessionGroups = useMemo(() => {
+        const catalogSessions = machineSessions
+            .filter((session) => session.metadata?.codexCatalogManaged === true
+                && session.metadata.codexProviderArchived !== true
+                && session.metadata.lifecycleState !== 'archived')
+            .sort((a, b) => (
+                (b.metadata?.codexUpdatedAt ?? b.updatedAt ?? 0)
+                - (a.metadata?.codexUpdatedAt ?? a.updatedAt ?? 0)
+            ));
+        const groups = new Map<string, Session[]>();
+        for (const session of catalogSessions) {
+            const path = session.metadata?.path?.trim() || '~';
+            const group = groups.get(path) ?? [];
+            group.push(session);
+            groups.set(path, group);
+        }
+        return [...groups.entries()].map(([path, sessions]) => ({ path, sessions }));
+    }, [machineSessions]);
+
     const previousSessions = useMemo(() => {
-        return [...machineSessions]
+        return machineSessions
+            .filter((session) => session.metadata?.codexCatalogManaged !== true)
             .sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0))
             .slice(0, 5);
     }, [machineSessions]);
@@ -79,8 +99,14 @@ export default function MachineDetailScreen() {
 
     const handleRefresh = async () => {
         setIsRefreshing(true);
-        await sync.refreshMachines();
-        setIsRefreshing(false);
+        try {
+            if (machineId && machine && isMachineOnline(machine)) {
+                await codexCatalogSync(machineId);
+            }
+            await Promise.all([sync.refreshMachines(), sync.refreshSessions()]);
+        } finally {
+            setIsRefreshing(false);
+        }
     };
 
     const handleDeleteMachine = async () => {
@@ -336,7 +362,25 @@ export default function MachineDetailScreen() {
                     </ItemGroup>
                 )}
 
-                {/* Recent sessions */}
+                {/* Unarchived Codex sessions, grouped by their real working directory. */}
+                {codexSessionGroups.map(({ path, sessions }) => {
+                    const displayPath = formatPathRelativeToHome(path, machine.metadata?.homeDir);
+                    return (
+                        <ItemGroup key={path} title={`Codex · ${displayPath} (${sessions.length})`}>
+                            {sessions.map((session) => (
+                                <Item
+                                    key={session.id}
+                                    title={getSessionName(session)}
+                                    subtitle={getSessionSubtitle(session)}
+                                    onPress={() => navigateToSession(session.id)}
+                                    rightElement={<Ionicons name="chevron-forward" size={20} color="#C7C7CC" />}
+                                />
+                            ))}
+                        </ItemGroup>
+                    );
+                })}
+
+                {/* Previous non-catalog sessions. */}
                 {previousSessions.length > 0 && (
                     <ItemGroup title={t('tabs.sessions')}>
                         {previousSessions.map(session => (

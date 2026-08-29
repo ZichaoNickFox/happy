@@ -52,6 +52,34 @@ describe('codex fork ops', () => {
         );
     });
 
+    it('routes catalog sync and thread mutations to the local machine daemon', async () => {
+        machineRPC
+            .mockResolvedValueOnce({ type: 'success', threads: [] })
+            .mockResolvedValue({ type: 'success' });
+
+        const {
+            codexArchiveThread,
+            codexCatalogSync,
+            codexDeleteThread,
+            codexRenameThread,
+            codexUnarchiveThread,
+        } = await import('./ops');
+
+        await expect(codexCatalogSync('machine-1')).resolves.toEqual({ type: 'success', threads: [] });
+        await codexRenameThread('machine-1', 'thread-1', 'New title');
+        await codexArchiveThread('machine-1', 'thread-1');
+        await codexUnarchiveThread('machine-1', 'thread-1');
+        await codexDeleteThread('machine-1', 'thread-1');
+
+        expect(machineRPC.mock.calls).toEqual([
+            ['machine-1', 'codex-catalog-sync', {}],
+            ['machine-1', 'codex-thread-rename', { threadId: 'thread-1', name: 'New title' }],
+            ['machine-1', 'codex-thread-archive', { threadId: 'thread-1' }],
+            ['machine-1', 'codex-thread-unarchive', { threadId: 'thread-1' }],
+            ['machine-1', 'codex-thread-delete', { threadId: 'thread-1' }],
+        ]);
+    });
+
     it('forks a full Codex thread and spawns a Codex session resumed to the new thread', async () => {
         machineRPC.mockImplementation(async (_machineId: string, method: string) => {
             if (method === 'codex-fork-thread') {

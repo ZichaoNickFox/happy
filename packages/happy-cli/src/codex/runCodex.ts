@@ -7,7 +7,6 @@ import { CodexPermissionHandler } from './utils/permissionHandler';
 import { ReasoningProcessor } from './utils/reasoningProcessor';
 import { DiffProcessor } from './utils/diffProcessor';
 import { randomUUID } from 'node:crypto';
-import { execSync } from 'node:child_process';
 import { logger } from '@/ui/logger';
 import { Credentials, readSettings } from '@/persistence';
 import { initialMachineMetadata } from '@/daemon/run';
@@ -42,12 +41,14 @@ import { prepareCodexImageInputItems } from './utils/imageInput';
 import { createSerialAsyncHandler } from './utils/serialAsyncHandler';
 import { buildCodexThreadBackfillEnvelopes } from './utils/threadImageBackfill';
 import {
+    buildCodexDeveloperInstructions,
     buildCodexTurnPrompt,
     hashCodexEnhancedMode,
     type CodexEnhancedMode,
 } from './codexPrompt';
 import { discoverCodexSkillCommands } from './codexSkills';
 import { CodexRemoteModeState } from './remoteModeState';
+import { isCodexExecutableAvailable, resolveCodexExecutable } from './codexExecutable';
 import {
     codexGoalActionCapabilities,
     mapCodexGoalEventToAgentGoalStatus,
@@ -104,9 +105,8 @@ export async function runCodex(opts: {
     effort?: ReasoningEffort;
 }): Promise<void> {
     // Early check: ensure Codex CLI is installed before proceeding
-    try {
-        execSync('codex --version', { encoding: 'utf8', stdio: 'pipe', windowsHide: true });
-    } catch {
+    const codexExecutable = resolveCodexExecutable();
+    if (!isCodexExecutableAvailable(codexExecutable)) {
         console.error('\n\x1b[1m\x1b[33mCodex CLI is not installed\x1b[0m\n');
         console.error('Please install Codex CLI using one of these methods:\n');
         console.error('\x1b[1mOption 1 - npm (recommended):\x1b[0m');
@@ -553,7 +553,7 @@ export async function runCodex(opts: {
     // Start Context 
     //
 
-    client = new CodexAppServerClient(sandboxConfig);
+    client = new CodexAppServerClient(sandboxConfig, codexExecutable);
 
     permissionHandler = new CodexPermissionHandler(session);
     // Drop any permission requests left in agent state from a previous CLI
@@ -947,8 +947,16 @@ export async function runCodex(opts: {
                 );
                 activeTurnPermissionMode = message.mode.permissionMode;
 
-                // Start thread on first turn (thread persists across mode changes)
+                const includeAppendSystemPrompt = Boolean(
+                    message.mode.appendSystemPrompt && !appendSystemPromptInjected,
+                );
+                const includeTitleInstruction = first;
+
+                // Start thread on first turn (thread persists across mode changes).
+                // Keep Happy's own instructions out of the persisted user text so
+                // Codex previews and titles reflect what the user actually wrote.
                 let activeThreadId = client.threadId;
+                let startedThreadForMessage = false;
                 if (!client.hasActiveThread() || !activeThreadId) {
                     const startedThread = await client.startThread({
                         model: message.mode.model,
@@ -956,8 +964,15 @@ export async function runCodex(opts: {
                         approvalPolicy: executionPolicy.approvalPolicy,
                         sandbox: executionPolicy.sandbox,
                         mcpServers,
+                        developerInstructions: buildCodexDeveloperInstructions({
+                            mode: message.mode,
+                            includeAppendSystemPrompt,
+                            includeTitleInstruction,
+                        }),
                     });
                     activeThreadId = startedThread.threadId;
+                    startedThreadForMessage = true;
+                    first = false;
                     session.updateMetadata((currentMetadata) => ({
                         ...currentMetadata,
                         codexThreadId: startedThread.threadId,
@@ -969,9 +984,6 @@ export async function runCodex(opts: {
                     continue;
                 }
 
-                const includeAppendSystemPrompt = Boolean(
-                    message.mode.appendSystemPrompt && !appendSystemPromptInjected,
-                );
                 const imageInputs = await prepareCodexImageInputItems(message.attachments, {
                     sessionId: session.sessionId,
                 });
@@ -989,12 +1001,14 @@ export async function runCodex(opts: {
                     });
                     continue;
                 }
-                const turnPrompt = buildCodexTurnPrompt({
-                    message: message.message,
-                    mode: message.mode,
-                    includeAppendSystemPrompt,
-                    includeTitleInstruction: first,
-                });
+                const turnPrompt = startedThreadForMessage
+                    ? message.message
+                    : buildCodexTurnPrompt({
+                        message: message.message,
+                        mode: message.mode,
+                        includeAppendSystemPrompt,
+                        includeTitleInstruction,
+                    });
 
                 const result = await client.sendTurnAndWait(turnPrompt, {
                     model: message.mode.model,

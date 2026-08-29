@@ -69,8 +69,11 @@ function isSessionActive(session: { active: boolean; activeAt: number }): boolea
  * instead of reshaping the groups above it.
  */
 function isSessionArchived(session: Session): boolean {
+    const isUnarchivedCodexCatalogSession = session.metadata?.codexCatalogManaged === true
+        && session.metadata.codexProviderArchived !== true
+        && session.metadata.lifecycleState !== 'archived';
     return session.metadata?.lifecycleState === 'archived'
-        || (!isRigMetadata(session.metadata) && !session.active);
+        || (!isRigMetadata(session.metadata) && !isUnarchivedCodexCatalogSession && !session.active);
 }
 
 /** "Today", "Yesterday", or "N days ago" for a flat row's date heading. */

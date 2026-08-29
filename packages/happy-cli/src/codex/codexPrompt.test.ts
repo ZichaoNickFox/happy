@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import { CHANGE_TITLE_INSTRUCTION } from '@/gemini/constants';
 import {
+    buildCodexDeveloperInstructions,
     buildCodexTurnPrompt,
     hashCodexEnhancedMode,
     stripHappySystemBlocks,
@@ -58,6 +59,16 @@ describe('buildCodexTurnPrompt', () => {
         });
 
         expect(prompt).toBe(`${wrapped(APPEND)}\n\nstart fresh`);
+    });
+});
+
+describe('buildCodexDeveloperInstructions', () => {
+    it('keeps Happy scaffolding out of the user turn', () => {
+        expect(buildCodexDeveloperInstructions({
+            mode: { appendSystemPrompt: APPEND },
+            includeAppendSystemPrompt: true,
+            includeTitleInstruction: true,
+        })).toBe(`${APPEND}\n\n${CHANGE_TITLE_INSTRUCTION}`);
     });
 });
 

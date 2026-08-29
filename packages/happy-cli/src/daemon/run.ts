@@ -35,6 +35,7 @@ import {
 } from './sessionEnvironment';
 import { startHappyTerminalDaemon } from './happyTerminalBoot';
 import { appendDaemonSpawnModeArgs, shouldForwardDaemonPermissionMode } from './spawnModeArgs';
+import { CodexSessionCatalog } from '@/codex/codexSessionCatalog';
 
 /** Shell-escape a string for safe interpolation into tmux commands. */
 function shellescape(s: string): string {
@@ -665,7 +666,29 @@ export async function startDaemon(): Promise<void> {
       for (const session of pidToTrackedSession.values()) {
         if (session.happySessionId === happySessionId) return session;
       }
-      return sessionIdToFinishedSession.get(happySessionId);
+      const finished = sessionIdToFinishedSession.get(happySessionId);
+      if (finished) return finished;
+
+      // The Codex catalog can discover and persist a provider thread after the
+      // daemon's startup preload. Resolve that record lazily so a phone can
+      // immediately resume a newly mirrored historical session.
+      const persistedSession = readPersistedSessions()[happySessionId];
+      if (!persistedSession) return undefined;
+      const tracked: TrackedSession = {
+        startedBy: 'persisted',
+        happySessionId,
+        happySessionMetadataFromLocalWebhook: persistedSession.metadata,
+        encryption: {
+          encryptionKey: decodeBase64(persistedSession.encryptionKey),
+          encryptionVariant: persistedSession.encryptionVariant,
+          seq: persistedSession.seq,
+          metadataVersion: persistedSession.metadataVersion,
+          agentStateVersion: persistedSession.agentStateVersion,
+        },
+        pid: 0,
+      };
+      sessionIdToFinishedSession.set(happySessionId, tracked);
+      return tracked;
     };
 
     const fetchServerSessionMetadata = async (sessionId: string, encryptionKey: Uint8Array, encryptionVariant: 'legacy' | 'dataKey'): Promise<Metadata | null> => {
@@ -877,17 +900,20 @@ export async function startDaemon(): Promise<void> {
 
     // Create realtime machine session
     const apiMachine = api.machineSyncClient(machine);
+    const codexCatalog = new CodexSessionCatalog(api, machineId);
 
     // Set RPC handlers
     apiMachine.setRPCHandlers({
       spawnSession,
       resumeSession,
       stopSession,
-      requestShutdown: () => requestShutdown('happy-app')
+      requestShutdown: () => requestShutdown('happy-app'),
+      codexCatalog,
     });
 
     // Connect to server
     apiMachine.connect();
+    void codexCatalog.start();
 
     // Every 60 seconds:
     // 1. Prune stale sessions
@@ -942,6 +968,7 @@ export async function startDaemon(): Promise<void> {
         // `happy daemon start` reads our still-present daemon.state.json, sees
         // isDaemonRunningCurrentlyInstalledHappyVersion() === true, and exits —
         // leaving nothing running once we also exit.
+        await codexCatalog.stop();
         apiMachine.shutdown();
         await stopControlServer();
         await cleanupDaemonState();
@@ -1011,6 +1038,7 @@ export async function startDaemon(): Promise<void> {
       // Give time for metadata update to send
       await new Promise(resolve => setTimeout(resolve, 100));
 
+      await codexCatalog.stop();
       apiMachine.shutdown();
       await stopControlServer();
       await cleanupDaemonState();
