@@ -355,7 +355,7 @@ describe('ApiSessionClient v3 messages API migration', () => {
 
         expect(settled).toBe(true);
         expect((client as any).pendingOutbox).toHaveLength(0);
-        expect((client as any).lastSeq).toBe(1);
+        expect((client as any).lastReceivedSeq).toBe(0);
     });
 
     it('retries failed POST and succeeds without dropping queued messages', async () => {

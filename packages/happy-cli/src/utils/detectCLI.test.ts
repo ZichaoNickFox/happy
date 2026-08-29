@@ -4,6 +4,7 @@ import os from 'os';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { findAgyBin } from '@/agy/constants';
+import { resolveConfiguredCodexExecutable } from '@/codex/codexExecutable';
 import { detectCLIAvailability } from './detectCLI';
 
 vi.mock('child_process', () => ({ execSync: vi.fn() }));
@@ -15,10 +16,12 @@ vi.mock('os', () => ({
   },
 }));
 vi.mock('@/agy/constants', () => ({ findAgyBin: vi.fn() }));
+vi.mock('@/codex/codexExecutable', () => ({ resolveConfiguredCodexExecutable: vi.fn() }));
 
 const mockedExecSync = vi.mocked(execSync);
 const mockedExistsSync = vi.mocked(existsSync);
 const mockedFindAgyBin = vi.mocked(findAgyBin);
+const mockedResolveConfiguredCodexExecutable = vi.mocked(resolveConfiguredCodexExecutable);
 const mockedPlatform = vi.mocked(os.platform);
 
 describe('CLI availability detection', () => {
@@ -31,6 +34,8 @@ describe('CLI availability detection', () => {
     mockedExistsSync.mockReturnValue(false);
     mockedFindAgyBin.mockReset();
     mockedFindAgyBin.mockReturnValue(undefined);
+    mockedResolveConfiguredCodexExecutable.mockReset();
+    mockedResolveConfiguredCodexExecutable.mockReturnValue(null);
     mockedPlatform.mockReturnValue('darwin');
   });
 
@@ -40,5 +45,11 @@ describe('CLI availability detection', () => {
     mockedFindAgyBin.mockReturnValue('/home/person/.local/bin/agy');
 
     expect(detectCLIAvailability().agy).toBe(true);
+  });
+
+  it('reports Codex when an explicitly configured executable is available', () => {
+    mockedResolveConfiguredCodexExecutable.mockReturnValue('/bundled/codex');
+
+    expect(detectCLIAvailability().codex).toBe(true);
   });
 });
