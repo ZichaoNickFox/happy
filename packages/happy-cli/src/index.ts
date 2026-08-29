@@ -35,6 +35,7 @@ import { handleResumeCommand } from '@/resume/handleResumeCommand'
 import { ensureDaemonRunning } from './daemon/ensureDaemonRunning'
 import { handleCodexCommand } from './commands/codexCommand'
 import { sanitizeSessionEnvironment } from './daemon/sessionEnvironment'
+import { runVscodeCodexProxy } from './codex/vscodeCodexProxy'
 
 
 (async () => {
@@ -52,7 +53,15 @@ import { sanitizeSessionEnvironment } from './daemon/sessionEnvironment'
   if (!args.includes('--version')) {
   }
 
-  if (subcommand === 'doctor') {
+  if (subcommand === 'vscode-codex-proxy') {
+    try {
+      await runVscodeCodexProxy(args.slice(1));
+    } catch (error) {
+      console.error(error instanceof Error ? error.message : String(error));
+      process.exit(1);
+    }
+    return;
+  } else if (subcommand === 'doctor') {
     // Check for clean subcommand
     if (args[1] === 'clean') {
       if (args.slice(2).some(a => a === '--help' || a === '-h')) {

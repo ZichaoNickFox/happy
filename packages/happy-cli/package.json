@@ -13,7 +13,8 @@
   },
   "bin": {
     "happy": "./bin/happy.mjs",
-    "happy-mcp": "./bin/happy-mcp.mjs"
+    "happy-mcp": "./bin/happy-mcp.mjs",
+    "happy-vscode-codex": "./bin/happy-vscode-codex.mjs"
   },
   "main": "./dist/index.cjs",
   "module": "./dist/index.mjs",

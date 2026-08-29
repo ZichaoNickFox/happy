@@ -1,0 +1,4 @@
+interface:
+  display_name: "Happy VS Code Codex"
+  short_description: "Build and verify the Happy Codex bridge"
+  default_prompt: "Use $vscode-skill to update and validate the Happy VS Code Codex mobile bridge."

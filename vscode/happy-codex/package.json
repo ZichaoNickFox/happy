@@ -1,0 +1,102 @@
+{
+  "name": "happy-codex",
+  "displayName": "Happy Codex Remote",
+  "description": "Synchronize the official VS Code Codex session with Happy for phone control.",
+  "version": "0.1.1",
+  "publisher": "slopus",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.96.2"
+  },
+  "categories": [
+    "AI",
+    "Other"
+  ],
+  "keywords": [
+    "happy",
+    "codex",
+    "mobile",
+    "remote control"
+  ],
+  "main": "./src/extension.js",
+  "activationEvents": [
+    "onStartupFinished",
+    "onView:happyCodex.controlCenter",
+    "onCommand:happyCodex.login",
+    "onCommand:happyCodex.enable",
+    "onCommand:happyCodex.disable",
+    "onCommand:happyCodex.status",
+    "onCommand:happyCodex.openCodex"
+  ],
+  "extensionDependencies": [
+    "openai.chatgpt"
+  ],
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "happyCodex",
+          "title": "Happy",
+          "icon": "media/happy.svg"
+        }
+      ]
+    },
+    "views": {
+      "happyCodex": [
+        {
+          "type": "webview",
+          "id": "happyCodex.controlCenter",
+          "name": "Codex 手机控制"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "happyCodex.login",
+        "title": "Login to Happy",
+        "category": "Happy Codex"
+      },
+      {
+        "command": "happyCodex.enable",
+        "title": "Enable Mobile Control",
+        "category": "Happy Codex"
+      },
+      {
+        "command": "happyCodex.disable",
+        "title": "Disable Mobile Control",
+        "category": "Happy Codex"
+      },
+      {
+        "command": "happyCodex.status",
+        "title": "Show Bridge Status",
+        "category": "Happy Codex"
+      },
+      {
+        "command": "happyCodex.openCodex",
+        "title": "Open Codex Sidebar",
+        "category": "Happy Codex"
+      },
+      {
+        "command": "happyCodex.refresh",
+        "title": "Refresh Account Status",
+        "category": "Happy Codex"
+      }
+    ],
+    "configuration": {
+      "title": "Happy Codex",
+      "properties": {
+        "happyCodex.happyExecutable": {
+          "type": "string",
+          "default": "happy",
+          "scope": "application",
+          "description": "Happy CLI executable name or absolute path. Run happy auth login before enabling the bridge."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "check": "node --check src/extension.js && node --check src/bridgeConfig.js && node --test",
+    "test": "node --test",
+    "package": "npx --yes @vscode/vsce@3.9.2 package --allow-missing-repository --no-dependencies"
+  }
+}
