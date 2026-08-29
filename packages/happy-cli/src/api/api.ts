@@ -137,6 +137,28 @@ export class ApiClient {
     }
   }
 
+  async deleteSession(sessionId: string): Promise<boolean> {
+    try {
+      const response = await axios.delete(
+        `${configuration.serverUrl}/v1/sessions/${encodeURIComponent(sessionId)}`,
+        {
+          headers: {
+            'Authorization': `Bearer ${this.credential.token}`,
+            'X-Happy-Client': `cli-coding-session/${configuration.currentCliVersion}`
+          },
+          timeout: 60000
+        }
+      );
+      return response.status >= 200 && response.status < 300;
+    } catch (error) {
+      if (axios.isAxiosError(error) && error.response?.status === 404) {
+        return true;
+      }
+      logger.debug(`[API] Failed to delete session ${sessionId}:`, error);
+      return false;
+    }
+  }
+
   /**
    * Register or update machine with the server
    * Returns the current machine state from the server with decrypted metadata and daemonState

@@ -2,7 +2,14 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'no
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { acquireDaemonLock, releaseDaemonLock, SandboxConfigSchema } from './persistence';
+import {
+    acquireDaemonLock,
+    persistSession,
+    readPersistedSessions,
+    releaseDaemonLock,
+    removePersistedSession,
+    SandboxConfigSchema,
+} from './persistence';
 
 const mockConfiguration = vi.hoisted(() => ({
     daemonLockFile: '',
@@ -132,5 +139,88 @@ describe('acquireDaemonLock', () => {
 
         expect(lockHandle).toBeNull();
         expect(readFileSync(mockConfiguration.daemonLockFile, 'utf-8')).toBe(String(process.pid));
+    });
+});
+
+describe('Codex catalog persistence', () => {
+    let testDir: string;
+
+    beforeEach(() => {
+        testDir = mkdtempSync(join(tmpdir(), 'happy-session-catalog-'));
+        mockConfiguration.sessionsFile = join(testDir, 'sessions.json');
+    });
+
+    afterEach(() => {
+        rmSync(testDir, { recursive: true, force: true });
+    });
+
+    it('retains old Codex thread keys while pruning ordinary stale sessions', () => {
+        const old = Date.now() - 30 * 24 * 60 * 60 * 1000;
+        const common = {
+            encryptionKey: 'key',
+            encryptionVariant: 'dataKey',
+            seq: 0,
+            metadataVersion: 0,
+            agentStateVersion: 0,
+            savedAt: old,
+        } as const;
+        writeFileSync(mockConfiguration.sessionsFile, JSON.stringify({
+            sessions: {
+                codex: {
+                    ...common,
+                    metadata: { flavor: 'codex', codexThreadId: 'thread-1', path: '/repo' },
+                },
+                claude: {
+                    ...common,
+                    metadata: { flavor: 'claude', claudeSessionId: 'session-1', path: '/repo' },
+                },
+            },
+        }), 'utf-8');
+
+        expect(Object.keys(readPersistedSessions())).toEqual(['codex']);
+        removePersistedSession('codex');
+        expect(readPersistedSessions()).toEqual({});
+    });
+
+    it('serializes session registry updates and leaves no lock or temporary file behind', () => {
+        const common = {
+            encryptionKey: 'key',
+            encryptionVariant: 'dataKey',
+            seq: 0,
+            metadataVersion: 0,
+            agentStateVersion: 0,
+            savedAt: Date.now(),
+        } as const;
+
+        persistSession('first', {
+            ...common,
+            metadata: {
+                flavor: 'codex',
+                codexThreadId: 'thread-1',
+                path: '/repo',
+                host: 'test-host',
+                homeDir: testDir,
+                happyHomeDir: testDir,
+                happyLibDir: testDir,
+                happyToolsDir: testDir,
+            },
+        });
+        persistSession('second', {
+            ...common,
+            metadata: {
+                flavor: 'codex',
+                codexThreadId: 'thread-2',
+                path: '/repo',
+                host: 'test-host',
+                homeDir: testDir,
+                happyHomeDir: testDir,
+                happyLibDir: testDir,
+                happyToolsDir: testDir,
+            },
+        });
+
+        expect(Object.keys(readPersistedSessions()).sort()).toEqual(['first', 'second']);
+        expect(existsSync(`${mockConfiguration.sessionsFile}.lock`)).toBe(false);
+        expect(existsSync(`${mockConfiguration.sessionsFile}.tmp`)).toBe(false);
     });
 });

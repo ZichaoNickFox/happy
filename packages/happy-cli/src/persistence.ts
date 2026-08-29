@@ -6,7 +6,8 @@
 
 import { FileHandle } from 'node:fs/promises'
 import { readFile, writeFile, mkdir, open, unlink, rename, stat } from 'node:fs/promises'
-import { existsSync, writeFileSync, readFileSync, unlinkSync, renameSync, linkSync } from 'node:fs'
+import { randomUUID } from 'node:crypto'
+import { existsSync, writeFileSync, readFileSync, unlinkSync, renameSync, linkSync, openSync, closeSync, statSync } from 'node:fs'
 import { constants } from 'node:fs'
 import { configuration } from '@/configuration'
 import * as z from 'zod';
@@ -41,6 +42,7 @@ interface Settings {
   machineId?: string
   machineIdConfirmedByServer?: boolean
   daemonAutoStartWhenRunningHappy?: boolean
+  codexPath?: string
   chromeMode?: boolean
   sandboxConfig?: SandboxConfig
   serverUrl?: string
@@ -440,7 +442,14 @@ export function readPersistedSessions(): Record<string, PersistedSession> {
     const now = Date.now();
     const sessions: Record<string, PersistedSession> = {};
     for (const [id, session] of Object.entries(data.sessions)) {
-      if (now - session.savedAt < SESSION_MAX_AGE_MS) {
+      // Codex catalog entries are the local key registry for stable
+      // (machineId, codexThreadId) Happy mirrors. Data-key sessions cannot be
+      // reopened from their server tag alone, so retain these mappings for as
+      // long as the provider thread exists locally.
+      const isCodexThreadMapping = session.metadata.flavor === 'codex'
+        && typeof session.metadata.codexThreadId === 'string'
+        && session.metadata.codexThreadId.length > 0;
+      if (isCodexThreadMapping || now - session.savedAt < SESSION_MAX_AGE_MS) {
         sessions[id] = session;
       }
     }
@@ -452,12 +461,83 @@ export function readPersistedSessions(): Record<string, PersistedSession> {
 
 export function persistSession(sessionId: string, session: PersistedSession): void {
   try {
-    const existing = readPersistedSessions();
-    existing[sessionId] = session;
-    const tmpFile = configuration.sessionsFile + '.tmp';
-    writeFileSync(tmpFile, JSON.stringify({ sessions: existing }, null, 2), 'utf-8');
-    renameSync(tmpFile, configuration.sessionsFile);
+    updatePersistedSessions((existing) => {
+      existing[sessionId] = session;
+    });
   } catch (error) {
     logger.debug(`[PERSISTENCE] Failed to persist session ${sessionId}:`, error);
+  }
+}
+
+export function removePersistedSession(sessionId: string): void {
+  try {
+    updatePersistedSessions((existing) => {
+      delete existing[sessionId];
+    });
+  } catch (error) {
+    logger.debug(`[PERSISTENCE] Failed to remove session ${sessionId}:`, error);
+  }
+}
+
+function isFileExistsError(error: unknown): boolean {
+  return error instanceof Error && 'code' in error && error.code === 'EEXIST';
+}
+
+function updatePersistedSessions(
+  update: (sessions: Record<string, PersistedSession>) => void,
+): void {
+  const lockFile = `${configuration.sessionsFile}.lock`;
+  const lockToken = `${process.pid}:${Date.now()}:${randomUUID()}`;
+  let lockFd: number | null = null;
+
+  for (let attempt = 0; attempt < 200 && lockFd === null; attempt += 1) {
+    try {
+      const candidateFd = openSync(lockFile, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY, 0o600);
+      try {
+        writeFileSync(candidateFd, lockToken, 'utf-8');
+        lockFd = candidateFd;
+      } catch (error) {
+        try {
+          closeSync(candidateFd);
+        } catch { }
+        try {
+          unlinkSync(lockFile);
+        } catch { }
+        throw error;
+      }
+    } catch (error) {
+      if (!isFileExistsError(error)) throw error;
+      try {
+        if (Date.now() - statSync(lockFile).mtimeMs > 30_000) unlinkSync(lockFile);
+      } catch {
+        // The lock may have been released between stat and unlink.
+      }
+      // These writes are tiny. A short synchronous wait keeps the existing
+      // persistence API synchronous while serializing daemon/proxy updates.
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);
+    }
+  }
+
+  if (lockFd === null) throw new Error('Timed out acquiring the sessions persistence lock');
+
+  const tmpFile = `${configuration.sessionsFile}.${process.pid}.${randomUUID()}.tmp`;
+  try {
+    const existing = readPersistedSessions();
+    update(existing);
+    writeFileSync(tmpFile, JSON.stringify({ sessions: existing }, null, 2), {
+      encoding: 'utf-8',
+      mode: 0o600,
+    });
+    renameSync(tmpFile, configuration.sessionsFile);
+  } finally {
+    try {
+      if (existsSync(tmpFile)) unlinkSync(tmpFile);
+    } catch { }
+    try {
+      closeSync(lockFd);
+    } catch { }
+    try {
+      if (readFileSync(lockFile, 'utf-8') === lockToken) unlinkSync(lockFile);
+    } catch { }
   }
 }

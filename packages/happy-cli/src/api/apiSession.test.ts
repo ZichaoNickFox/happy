@@ -212,6 +212,19 @@ describe('ApiSessionClient v3 messages API migration', () => {
         await client.close();
     });
 
+    it('does not reconnect after the client is explicitly closed', async () => {
+        vi.useFakeTimers();
+        const client = new ApiSessionClient('fake-token', session);
+
+        await client.close();
+        mockSocket.connected = false;
+        emitSocketEvent('disconnect', 'io client disconnect');
+        emitSocketEvent('connect_error', new Error('late failure'));
+
+        await vi.advanceTimersByTimeAsync(5000);
+        expect(mockSocket.connect).toHaveBeenCalledTimes(1);
+    });
+
     it('queues codex message to v3 outbox, sends once, and drains outbox', async () => {
         const client = new ApiSessionClient('fake-token', session);
         mockAxiosPost.mockResolvedValueOnce({
@@ -304,6 +317,45 @@ describe('ApiSessionClient v3 messages API migration', () => {
         expect(secondPayload.messages).toHaveLength(2);
         expect((client as any).pendingOutbox).toHaveLength(0);
         expect((client as any).lastReceivedSeq).toBe(0);
+    });
+
+    it('flushFully does not resolve until the durable outbox is drained', async () => {
+        const client = new ApiSessionClient('fake-token', session);
+        type PostResponse = {
+            data: {
+                messages: Array<{ id: string; seq: number; localId: string; createdAt: number; updatedAt: number }>;
+            };
+        };
+        let resolvePost!: (value: PostResponse) => void;
+        mockAxiosPost.mockImplementationOnce(() => new Promise<PostResponse>((resolve) => {
+            resolvePost = resolve;
+        }));
+
+        client.sendSessionProtocolMessageWithLocalId({
+            id: 'history-1',
+            time: 1,
+            role: 'agent',
+            ev: { t: 'text', text: 'history' },
+        }, 'history-1');
+        await waitForCheck(() => expect(mockAxiosPost).toHaveBeenCalledTimes(1));
+
+        let settled = false;
+        const flushed = client.flushFully().then(() => {
+            settled = true;
+        });
+        await Promise.resolve();
+        expect(settled).toBe(false);
+
+        resolvePost({
+            data: {
+                messages: [{ id: 'msg-1', seq: 1, localId: 'history-1', createdAt: 1, updatedAt: 1 }],
+            },
+        });
+        await flushed;
+
+        expect(settled).toBe(true);
+        expect((client as any).pendingOutbox).toHaveLength(0);
+        expect((client as any).lastSeq).toBe(1);
     });
 
     it('retries failed POST and succeeds without dropping queued messages', async () => {
@@ -755,7 +807,7 @@ describe('ApiSessionClient v3 messages API migration', () => {
                             t: 'encrypted',
                             c: encryptContent(session, userMessage)
                         },
-                        localId: null,
+                        localId: 'mobile-local-1',
                         createdAt: 1000,
                         updatedAt: 1000
                     }
@@ -772,7 +824,10 @@ describe('ApiSessionClient v3 messages API migration', () => {
             after_seq: 0,
             limit: 100
         });
-        expect(onUserMessage).toHaveBeenCalledWith(userMessage);
+        expect(onUserMessage).toHaveBeenCalledWith({
+            ...userMessage,
+            localKey: 'mobile-local-1',
+        });
         expect((client as any).lastReceivedSeq).toBe(1);
     });
 

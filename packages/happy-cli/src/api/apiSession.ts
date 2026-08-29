@@ -90,6 +90,11 @@ function isRecord(value: unknown): value is Record<string, unknown> {
     return typeof value === 'object' && value !== null;
 }
 
+function withMessageLocalKey(body: unknown, localId: string | null | undefined): unknown {
+    if (!localId || !isRecord(body) || body.role !== 'user') return body;
+    return { ...body, localKey: localId };
+}
+
 function extensionForImageMime(mimeType: string): string {
     switch (mimeType.toLowerCase()) {
         case 'image/jpeg':
@@ -239,6 +244,7 @@ export class ApiSessionClient extends EventEmitter {
     private pendingOutbox: Array<{ content: string; localId: string }> = [];
     private readonly sendSync: InvalidateSync;
     private readonly receiveSync: InvalidateSync;
+    private closed = false;
 
     constructor(token: string, session: Session) {
         super()
@@ -302,13 +308,13 @@ export class ApiSessionClient extends EventEmitter {
         this.socket.on('disconnect', (reason) => {
             logger.debug(`[API] Socket disconnected: ${reason}`);
             this.rpcHandlerManager.onSocketDisconnect();
-            this.startSmartReconnect();
+            if (!this.closed) this.startSmartReconnect();
         })
 
         this.socket.on('connect_error', (error) => {
             logger.debug('[API] Socket connection error:', error);
             this.rpcHandlerManager.onSocketDisconnect();
-            this.startSmartReconnect();
+            if (!this.closed) this.startSmartReconnect();
         })
 
         // Server events
@@ -327,7 +333,8 @@ export class ApiSessionClient extends EventEmitter {
                         this.receiveSync.invalidate();
                         return;
                     }
-                    const body = decrypt(this.encryptionKey, this.encryptionVariant, decodeBase64(data.body.message.content.c));
+                    const decrypted = decrypt(this.encryptionKey, this.encryptionVariant, decodeBase64(data.body.message.content.c));
+                    const body = withMessageLocalKey(decrypted, data.body.message.localId);
                     logger.debug('[SOCKET] [UPDATE] Decrypted message', {
                         role: typeof (body as { role?: unknown })?.role === 'string'
                             ? (body as { role: string }).role
@@ -626,7 +633,8 @@ export class ApiSessionClient extends EventEmitter {
                 }
 
                 try {
-                    const body = decrypt(this.encryptionKey, this.encryptionVariant, decodeBase64(message.content.c));
+                    const decrypted = decrypt(this.encryptionKey, this.encryptionVariant, decodeBase64(message.content.c));
+                    const body = withMessageLocalKey(decrypted, message.localId);
                     this.routeIncomingMessage(body);
                 } catch (error) {
                     logger.debug('[API] Failed to decrypt fetched message', {
@@ -684,11 +692,11 @@ export class ApiSessionClient extends EventEmitter {
         }
     }
 
-    private enqueueMessage(content: unknown, invalidate: boolean = true) {
+    private enqueueMessage(content: unknown, invalidate: boolean = true, localId: string = randomUUID()) {
         const encrypted = encodeBase64(encrypt(this.encryptionKey, this.encryptionVariant, content));
         this.pendingOutbox.push({
             content: encrypted,
-            localId: randomUUID()
+            localId
         });
         if (invalidate) {
             this.sendSync.invalidate();
@@ -790,7 +798,11 @@ export class ApiSessionClient extends EventEmitter {
         this.enqueueMessage(content);
     }
 
-    private enqueueSessionProtocolEnvelope(envelope: SessionEnvelope, invalidate: boolean = true) {
+    private enqueueSessionProtocolEnvelope(
+        envelope: SessionEnvelope,
+        invalidate: boolean = true,
+        localId?: string,
+    ) {
         const content = {
             role: 'session',
             content: envelope,
@@ -799,7 +811,7 @@ export class ApiSessionClient extends EventEmitter {
             }
         };
 
-        this.enqueueMessage(content, invalidate);
+        this.enqueueMessage(content, invalidate, localId);
     }
 
     sendSessionProtocolMessage(envelope: SessionEnvelope) {
@@ -814,6 +826,15 @@ export class ApiSessionClient extends EventEmitter {
         }
 
         this.enqueueSessionProtocolEnvelope(envelope);
+    }
+
+    /**
+     * Enqueue a provider-history envelope with a stable server-side idempotency
+     * key. Replaying the same Codex thread during reconciliation is therefore
+     * safe and does not duplicate messages.
+     */
+    sendSessionProtocolMessageWithLocalId(envelope: SessionEnvelope, localId: string) {
+        this.enqueueSessionProtocolEnvelope(envelope, true, localId);
     }
 
     /**
@@ -920,6 +941,19 @@ export class ApiSessionClient extends EventEmitter {
         return this.metadata;
     }
 
+    getSessionSnapshot(): Session {
+        return {
+            id: this.sessionId,
+            seq: this.lastReceivedSeq,
+            encryptionKey: this.encryptionKey,
+            encryptionVariant: this.encryptionVariant,
+            metadata: this.metadata!,
+            metadataVersion: this.metadataVersion,
+            agentState: this.agentState,
+            agentStateVersion: this.agentStateVersion,
+        };
+    }
+
     /**
      * Update session metadata
      * @param handler - Handler function that returns the updated metadata
@@ -933,7 +967,11 @@ export class ApiSessionClient extends EventEmitter {
     }
 
     updateMetadata(handler: (metadata: Metadata) => Metadata) {
-        this.metadataLock.inLock(async () => {
+        void this.updateMetadataAndWait(handler);
+    }
+
+    async updateMetadataAndWait(handler: (metadata: Metadata) => Metadata): Promise<void> {
+        await this.metadataLock.inLock(async () => {
             await backoff(async () => {
                 let updated = handler(this.metadata!); // Weird state if metadata is null - should never happen but here we are
                 const answer = await this.socket.emitWithAck('update-metadata', { sid: this.sessionId, expectedVersion: this.metadataVersion, metadata: encodeBase64(encrypt(this.encryptionKey, this.encryptionVariant, updated)) });
@@ -1002,8 +1040,14 @@ export class ApiSessionClient extends EventEmitter {
         });
     }
 
+    /** Wait until the entire durable outbox is accepted by the server. */
+    async flushFully(): Promise<void> {
+        await this.sendSync.invalidateAndAwait();
+    }
+
     async close() {
         logger.debug('[API] socket.close() called');
+        this.closed = true;
         this.sendSync.stop();
         this.receiveSync.stop();
         if (this.reconnectInterval) {
@@ -1014,9 +1058,14 @@ export class ApiSessionClient extends EventEmitter {
     }
 
     private startSmartReconnect() {
-        if (this.reconnectInterval) return;
+        if (this.closed || this.reconnectInterval) return;
 
         this.reconnectInterval = setInterval(() => {
+            if (this.closed) {
+                clearInterval(this.reconnectInterval!);
+                this.reconnectInterval = null;
+                return;
+            }
             if (this.socket.connected) {
                 clearInterval(this.reconnectInterval!);
                 this.reconnectInterval = null;
@@ -1032,7 +1081,9 @@ export class ApiSessionClient extends EventEmitter {
 
         if (shouldReconnect()) {
             logger.debug('[API] Network up + lid open — reconnecting in 1s');
-            setTimeout(() => { if (!this.socket.connected) this.socket.connect() }, 1000);
+            setTimeout(() => {
+                if (!this.closed && !this.socket.connected) this.socket.connect();
+            }, 1000);
         }
     }
 }
