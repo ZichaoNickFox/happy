@@ -35,6 +35,27 @@ type ThreadBridge = {
     closePromise: Promise<void> | null;
 };
 
+const BRIDGE_CLOUD_CLOSE_TIMEOUT_MS = 5_000;
+const VSCODE_THREAD_REFRESH_INTERVAL_MS = 2_000;
+
+export async function waitForBridgeCloudClose(
+    cleanup: Promise<void>,
+    timeoutMs = BRIDGE_CLOUD_CLOSE_TIMEOUT_MS,
+): Promise<boolean> {
+    let timer: NodeJS.Timeout | undefined;
+    try {
+        return await Promise.race([
+            cleanup.then(() => true),
+            new Promise<boolean>((resolve) => {
+                timer = setTimeout(() => resolve(false), timeoutMs);
+                timer.unref();
+            }),
+        ]);
+    } finally {
+        if (timer) clearTimeout(timer);
+    }
+}
+
 function proxyLog(message: string): void {
     process.stderr.write(`[happy-vscode] ${message}\n`);
 }
@@ -214,6 +235,8 @@ export async function runVscodeCodexProxy(args: string[]): Promise<void> {
             });
         },
     });
+    const threadRefresh = setInterval(() => core.refreshVisibleThreads(), VSCODE_THREAD_REFRESH_INTERVAL_MS);
+    threadRefresh.unref();
 
     closeThreadBridge = (threadId, bridge, reason, archiveThread) => {
         if (bridge.closePromise) return bridge.closePromise;
@@ -222,16 +245,21 @@ export async function runVscodeCodexProxy(args: string[]): Promise<void> {
         if (archiveThread) core.archiveMobileThread(threadId);
         bridge.closePromise = (async () => {
             try {
-                await bridge.session.updateMetadataAndWait((current) => ({
-                    ...current,
-                    lifecycleState: 'archived',
-                    lifecycleStateSince: Date.now(),
-                    archivedBy: 'cli',
-                    archiveReason: reason,
-                    ...(archiveThread ? { codexProviderArchived: true } : {}),
-                }));
-                bridge.session.sendSessionDeath();
-                await bridge.session.flush();
+                const cloudClosed = await waitForBridgeCloudClose((async () => {
+                    await bridge.session.updateMetadataAndWait((current) => ({
+                        ...current,
+                        lifecycleState: 'archived',
+                        lifecycleStateSince: Date.now(),
+                        archivedBy: 'cli',
+                        archiveReason: reason,
+                        ...(archiveThread ? { codexProviderArchived: true } : {}),
+                    }));
+                    bridge.session.sendSessionDeath();
+                    await bridge.session.flush();
+                })());
+                if (!cloudClosed) {
+                    proxyLog(`Timed out closing Happy session for Codex thread ${threadId}; closing locally.`);
+                }
             } catch (error) {
                 proxyLog(`Failed to close Happy bridge for Codex thread ${threadId}: ${error instanceof Error ? error.message : String(error)}`);
             } finally {
@@ -263,6 +291,7 @@ export async function runVscodeCodexProxy(args: string[]): Promise<void> {
     });
 
     const shutdown = async (): Promise<void> => {
+        clearInterval(threadRefresh);
         vscodeInput.close();
         codexOutput.close();
         const active = await Promise.all(bridges.values());

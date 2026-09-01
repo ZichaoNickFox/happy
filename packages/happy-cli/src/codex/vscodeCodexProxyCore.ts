@@ -38,6 +38,14 @@ type PendingRequest = {
     injected: boolean;
 };
 
+const RECENT_THREAD_LIST_PARAMS = {
+    archived: false,
+    limit: 100,
+    sortKey: 'updated_at',
+    sortDirection: 'desc',
+    sourceKinds: ['cli', 'vscode', 'exec', 'appServer', 'unknown'],
+};
+
 function record(value: unknown): Record<string, unknown> | null {
     return value && typeof value === 'object' && !Array.isArray(value)
         ? value as Record<string, unknown>
@@ -72,6 +80,21 @@ function extractResultTurnId(result: unknown): string | null {
     const resultRecord = record(result);
     const turn = record(resultRecord?.turn);
     return nonEmptyString(turn?.id);
+}
+
+function extractResultThreads(result: unknown): Record<string, unknown>[] {
+    const data = record(result)?.data;
+    return Array.isArray(data)
+        ? data.map(record).filter((thread): thread is Record<string, unknown> => thread !== null)
+        : [];
+}
+
+function threadListFingerprint(thread: Record<string, unknown>): string {
+    return JSON.stringify([
+        thread.name,
+        thread.preview,
+        thread.recencyAt ?? thread.updatedAt,
+    ]);
 }
 
 function extractTurnId(params: Record<string, unknown> | undefined): string | null {
@@ -210,6 +233,9 @@ export class VscodeCodexProxyCore {
     private readonly threadCwds = new Map<string, string>();
     private readonly lastTurnParams = new Map<string, Record<string, unknown>>();
     private readonly activeTurns = new Map<string, string>();
+    private readonly visibleThreadFingerprints = new Map<string, string>();
+    private initialized = false;
+    private threadListRefreshPending = false;
     private injectedSequence = 0;
 
     constructor(private readonly hooks: ProxyHooks) {}
@@ -237,6 +263,7 @@ export class VscodeCodexProxyCore {
         }
 
         this.hooks.writeToCodex(message);
+        if (message.method === 'initialized') this.initialized = true;
     }
 
     fromCodex(message: JsonRpcMessage): void {
@@ -284,6 +311,12 @@ export class VscodeCodexProxyCore {
         });
     }
 
+    refreshVisibleThreads(): void {
+        if (!this.initialized || this.threadListRefreshPending) return;
+        this.threadListRefreshPending = true;
+        this.inject('thread/list', RECENT_THREAD_LIST_PARAMS);
+    }
+
     /**
      * Archive one VS Code thread and detach its Happy mobile bridge without
      * stopping the shared app-server process that may own other threads.
@@ -303,6 +336,10 @@ export class VscodeCodexProxyCore {
     }
 
     private handleResponse(message: JsonRpcMessage, pending: PendingRequest): void {
+        if (pending.method === 'thread/list') {
+            if (pending.injected) this.threadListRefreshPending = false;
+            if (!message.error) this.handleThreadList(message.result, pending.injected);
+        }
         if (message.error) return;
 
         if (pending.method === 'thread/start' || pending.method === 'thread/resume' || pending.method === 'thread/fork') {
@@ -331,6 +368,7 @@ export class VscodeCodexProxyCore {
             // generation. They are not provider sessions and must not appear as
             // separate conversations on the phone.
             if (thread?.ephemeral === true) return;
+            if (thread) this.rememberVisibleThread(thread);
             this.registerThread(threadId, nonEmptyString(thread?.cwd) ?? this.threadCwds.get(threadId) ?? process.cwd());
         }
 
@@ -351,5 +389,29 @@ export class VscodeCodexProxyCore {
         if (this.threadCwds.has(threadId)) return;
         this.threadCwds.set(threadId, cwd);
         this.hooks.registerThread({ threadId, cwd });
+    }
+
+    private handleThreadList(result: unknown, injected: boolean): void {
+        for (const thread of extractResultThreads(result)) {
+            const threadId = nonEmptyString(thread.id);
+            if (!threadId || thread.ephemeral === true) continue;
+            const fingerprint = threadListFingerprint(thread);
+            const changed = this.visibleThreadFingerprints.get(threadId) !== fingerprint;
+            this.visibleThreadFingerprints.set(threadId, fingerprint);
+            if (injected && changed) {
+                // Another Codex app-server may have created this thread from
+                // Happy mobile. The official VS Code UI only refreshes its
+                // in-memory list when it receives a standard lifecycle event.
+                this.hooks.writeToVscode({
+                    method: 'thread/started',
+                    params: { thread },
+                });
+            }
+        }
+    }
+
+    private rememberVisibleThread(thread: Record<string, unknown>): void {
+        const threadId = nonEmptyString(thread.id);
+        if (threadId) this.visibleThreadFingerprints.set(threadId, threadListFingerprint(thread));
     }
 }

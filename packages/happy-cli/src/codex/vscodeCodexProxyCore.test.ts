@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 
 import { VscodeCodexProxyCore, mapCodexNotificationToEnvelopes } from './vscodeCodexProxyCore';
+import { waitForBridgeCloudClose } from './vscodeCodexProxy';
 
 function createHarness() {
     const writeToCodex = vi.fn();
@@ -138,6 +139,81 @@ describe('VscodeCodexProxyCore', () => {
         harness.proxy.fromVscode({ id: 2, method: 'thread/resume', params: { threadId: 'thread-1', cwd: '/repo' } });
         harness.proxy.fromCodex({ id: 2, result: { thread: { id: 'thread-1' } } });
         expect(harness.registerThread).toHaveBeenCalledTimes(2);
+    });
+
+    it('refreshes the open VS Code thread list when another Codex process creates a thread', () => {
+        const harness = createHarness();
+        harness.proxy.fromVscode({ method: 'initialized' });
+        harness.proxy.fromVscode({ id: 10, method: 'thread/list', params: {} });
+        harness.proxy.fromCodex({
+            id: 10,
+            result: {
+                data: [{ id: 'known-thread', preview: 'Known', updatedAt: 1 }],
+                nextCursor: null,
+            },
+        });
+
+        harness.proxy.refreshVisibleThreads();
+        const refresh = harness.writeToCodex.mock.calls.at(-1)?.[0];
+        expect(refresh).toMatchObject({
+            method: 'thread/list',
+            params: { archived: false, limit: 100, sortKey: 'updated_at', sortDirection: 'desc' },
+        });
+        harness.proxy.fromCodex({
+            id: refresh.id,
+            result: {
+                data: [
+                    { id: 'new-phone-thread', preview: 'From phone', updatedAt: 2 },
+                    { id: 'known-thread', preview: 'Known', updatedAt: 1 },
+                ],
+                nextCursor: null,
+            },
+        });
+
+        expect(harness.writeToVscode).toHaveBeenCalledWith({
+            method: 'thread/started',
+            params: { thread: { id: 'new-phone-thread', preview: 'From phone', updatedAt: 2 } },
+        });
+        expect(harness.writeToVscode).not.toHaveBeenCalledWith(expect.objectContaining({ id: refresh.id }));
+    });
+
+    it('does not overlap or repeat unchanged thread-list refreshes', () => {
+        const harness = createHarness();
+        harness.proxy.refreshVisibleThreads();
+        expect(harness.writeToCodex).not.toHaveBeenCalled();
+
+        harness.proxy.fromVscode({ method: 'initialized' });
+        harness.proxy.refreshVisibleThreads();
+        harness.proxy.refreshVisibleThreads();
+        const refresh = harness.writeToCodex.mock.calls.at(-1)?.[0];
+        expect(harness.writeToCodex).toHaveBeenCalledTimes(2);
+
+        const result = {
+            data: [{ id: 'phone-thread', preview: 'From phone', updatedAt: 2 }],
+            nextCursor: null,
+        };
+        harness.proxy.fromCodex({ id: refresh.id, result });
+        harness.proxy.refreshVisibleThreads();
+        const secondRefresh = harness.writeToCodex.mock.calls.at(-1)?.[0];
+        harness.proxy.fromCodex({ id: secondRefresh.id, result });
+
+        const updates = harness.writeToVscode.mock.calls
+            .map(([message]) => message)
+            .filter((message) => message.method === 'thread/started');
+        expect(updates).toHaveLength(1);
+    });
+});
+
+describe('waitForBridgeCloudClose', () => {
+    it('lets proxy shutdown continue when cloud cleanup stalls', async () => {
+        vi.useFakeTimers();
+        try {
+            const result = waitForBridgeCloudClose(new Promise<void>(() => {}), 100);
+            await vi.advanceTimersByTimeAsync(100);
+            await expect(result).resolves.toBe(false);
+        } finally {
+            vi.useRealTimers();
+        }
     });
 });
 

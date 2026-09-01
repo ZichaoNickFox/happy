@@ -358,6 +358,17 @@ describe('ApiSessionClient v3 messages API migration', () => {
         expect((client as any).lastReceivedSeq).toBe(0);
     });
 
+    it('stops retrying a metadata update after the session closes', async () => {
+        const client = new ApiSessionClient('fake-token', session);
+        mockSocket.emitWithAck.mockImplementationOnce(async () => {
+            await client.close();
+            throw new Error('session was deleted');
+        });
+
+        await expect(client.updateMetadataAndWait((metadata) => metadata)).resolves.toBeUndefined();
+        expect(mockSocket.emitWithAck).toHaveBeenCalledTimes(1);
+    });
+
     it('retries failed POST and succeeds without dropping queued messages', async () => {
         const client = new ApiSessionClient('fake-token', session);
 

@@ -973,6 +973,7 @@ export class ApiSessionClient extends EventEmitter {
     async updateMetadataAndWait(handler: (metadata: Metadata) => Metadata): Promise<void> {
         await this.metadataLock.inLock(async () => {
             await backoff(async () => {
+                if (this.closed) return;
                 let updated = handler(this.metadata!); // Weird state if metadata is null - should never happen but here we are
                 const answer = await this.socket.emitWithAck('update-metadata', { sid: this.sessionId, expectedVersion: this.metadataVersion, metadata: encodeBase64(encrypt(this.encryptionKey, this.encryptionVariant, updated)) });
                 if (answer.result === 'success') {
