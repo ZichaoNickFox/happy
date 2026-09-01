@@ -287,6 +287,7 @@ export class CodexAppServerClient {
     // Session state
     private _threadId: string | null = null;
     private _turnId: string | null = null;
+    private threadLoaded = false;
     private threadDefaults: {
         model?: string;
         cwd?: string;
@@ -744,6 +745,7 @@ export class CodexAppServerClient {
                 return;
             }
             this.connected = false;
+            this.threadLoaded = false;
             // Reject all pending requests
             for (const [id, req] of this.pending) {
                 if (req.epoch !== epoch) continue;
@@ -816,6 +818,7 @@ export class CodexAppServerClient {
         this.process = null;
         this.connected = false;
         this._turnId = null;
+        this.threadLoaded = false;
         this.notificationProtocol = 'unknown';
         this.completedTurnIds.clear();
         if (!opts?.preserveThreadState) {
@@ -897,6 +900,7 @@ export class CodexAppServerClient {
         const result = await this.request('thread/start', params) as NewConversationResponse;
         this._threadId = result.thread.id;
         this._turnId = null;
+        this.threadLoaded = true;
         this.rawSubagentActivitySignaturesByItemId.clear();
         this.rememberThreadDefaults(opts);
         logger.debug('[CodexAppServer] Thread started:', this._threadId);
@@ -934,6 +938,7 @@ export class CodexAppServerClient {
         const result = await this.request('thread/resume', params) as ResumeConversationResponse;
         this._threadId = result.thread.id;
         this._turnId = null;
+        this.threadLoaded = true;
         this.rawSubagentActivitySignaturesByItemId.clear();
         this.rememberThreadDefaults({
             model: opts?.model ?? defaults.model,
@@ -974,6 +979,7 @@ export class CodexAppServerClient {
         const result = await this.request('thread/fork', params) as ForkConversationResponse;
         this._threadId = result.thread.id;
         this._turnId = null;
+        this.threadLoaded = true;
         this.rememberThreadDefaults({
             model: opts.model ?? defaults.model,
             cwd: opts.cwd ?? defaults.cwd,
@@ -1017,6 +1023,29 @@ export class CodexAppServerClient {
         return await this.request('thread/delete', opts) as ThreadMutationResponse;
     }
 
+    async releaseThread(): Promise<void> {
+        if (!this._threadId || !this.threadLoaded || this._turnId || this.hasPendingTurnCompletion()) {
+            return;
+        }
+
+        const threadId = this._threadId;
+        await this.request('thread/unsubscribe', { threadId });
+        if (this._threadId === threadId) {
+            this.threadLoaded = false;
+        }
+        logger.debug('[CodexAppServer] Thread released:', threadId);
+    }
+
+    private async ensureThreadLoaded(): Promise<void> {
+        if (this.threadLoaded) {
+            return;
+        }
+        if (!this._threadId) {
+            throw new Error('No active thread. Call startThread first.');
+        }
+        await this.resumeThread({ threadId: this._threadId });
+    }
+
     async rollbackThread(opts: {
         threadId: string;
         numTurns: number;
@@ -1045,6 +1074,9 @@ export class CodexAppServerClient {
         status?: ThreadGoalSetParams['status'];
         tokenBudget?: number | null;
     }): Promise<ThreadGoalSetResponse> {
+        if (opts.threadId === this._threadId) {
+            await this.ensureThreadLoaded();
+        }
         const params: ThreadGoalSetParams = {
             threadId: opts.threadId,
             objective: opts.objective,
@@ -1057,6 +1089,9 @@ export class CodexAppServerClient {
     async clearGoal(opts: {
         threadId: string;
     }): Promise<ThreadGoalClearResponse> {
+        if (opts.threadId === this._threadId) {
+            await this.ensureThreadLoaded();
+        }
         const params: ThreadGoalClearParams = {
             threadId: opts.threadId,
         };
@@ -1204,6 +1239,7 @@ export class CodexAppServerClient {
         if (!this._threadId) {
             throw new Error('No active thread. Call startThread first.');
         }
+        await this.ensureThreadLoaded();
 
         const extraInputItems = opts?.extraInputItems ?? [];
         const input: InputItem[] = [];
@@ -1399,6 +1435,7 @@ export class CodexAppServerClient {
         this.resolvePendingTurn(true);
         this._threadId = null;
         this._turnId = null;
+        this.threadLoaded = false;
         this.threadDefaults = null;
         this.completedTurnIds.clear();
         this.rawFileChangesByItemId.clear();

@@ -554,6 +554,16 @@ export async function runCodex(opts: {
     //
 
     client = new CodexAppServerClient(sandboxConfig, codexExecutable);
+    const releaseThreadIfIdle = async () => {
+        if (shouldExit || messageQueue.size() > 0) {
+            return;
+        }
+        try {
+            await client.releaseThread();
+        } catch (error) {
+            logger.debug('[Codex] Failed to release idle thread:', error);
+        }
+    };
 
     permissionHandler = new CodexPermissionHandler(session);
     // Drop any permission requests left in agent state from a previous CLI
@@ -635,6 +645,8 @@ export async function runCodex(opts: {
         if (!handled) {
             throw new Error('Codex goal actions are not supported by this runtime');
         }
+
+        await releaseThreadIfIdle();
 
         return { ok: true };
     });
@@ -873,6 +885,8 @@ export async function runCodex(opts: {
             }));
         }
 
+        await releaseThreadIfIdle();
+
         let pending: { message: string; mode: EnhancedMode; isolate: boolean; hash: string; attachments?: PendingAttachment[] } | null = null;
 
         while (!shouldExit) {
@@ -1040,6 +1054,7 @@ export async function runCodex(opts: {
                 activeTurnPermissionMode = undefined;
                 thinking = false;
                 session.keepAlive(thinking, 'remote');
+                await releaseThreadIfIdle();
                 emitReadyIfIdle({
                     pending,
                     queueSize: () => messageQueue.size(),

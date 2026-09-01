@@ -785,6 +785,74 @@ describe('CodexAppServerClient sandbox integration', () => {
         await client.disconnect();
     });
 
+    it('releases an idle thread and resumes it before the next turn', async () => {
+        const requests: MockRpcMessage[] = [];
+        const proc = createMockProcess({
+            pid: 2701,
+            onRequest: (msg, stdout) => {
+                requests.push(msg);
+
+                if ((msg.method === 'thread/start' || msg.method === 'thread/resume') && msg.id != null) {
+                    setTimeout(() => {
+                        pushJsonLine(stdout, {
+                            id: msg.id,
+                            result: {
+                                thread: { id: 'thread-release', path: '/tmp/thread-release' },
+                                model: 'gpt-test',
+                            },
+                        });
+                    }, 0);
+                }
+                if (msg.method === 'thread/unsubscribe' && msg.id != null) {
+                    setTimeout(() => {
+                        pushJsonLine(stdout, { id: msg.id, result: { status: 'unsubscribed' } });
+                    }, 0);
+                }
+                if (msg.method === 'turn/start' && msg.id != null) {
+                    setTimeout(() => {
+                        pushJsonLine(stdout, { id: msg.id, result: { turn: { id: 'turn-release' } } });
+                        pushJsonLine(stdout, {
+                            method: 'turn/completed',
+                            params: {
+                                threadId: 'thread-release',
+                                turn: { id: 'turn-release', items: [], status: 'completed', error: null },
+                            },
+                        });
+                    }, 0);
+                }
+            },
+        });
+        mockSpawn.mockImplementation(() => proc);
+
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        const client = new CodexAppServerClient();
+
+        await client.connect();
+        await client.startThread({
+            model: 'gpt-test',
+            cwd: '/tmp/project',
+            approvalPolicy: 'on-request',
+            sandbox: 'read-only',
+        });
+        await client.releaseThread();
+        await client.sendTurnAndWait('continue');
+
+        expect(requests.map((msg) => msg.method).filter(Boolean)).toEqual([
+            'initialize',
+            'initialized',
+            'thread/start',
+            'thread/unsubscribe',
+            'thread/resume',
+            'turn/start',
+        ]);
+        expect(requests.find((msg) => msg.method === 'thread/unsubscribe')?.params).toEqual({
+            threadId: 'thread-release',
+        });
+        expect(client.threadId).toBe('thread-release');
+
+        await client.disconnect();
+    });
+
     it('sends extra localImage input items and omits empty text for image-only turns', async () => {
         const requests: MockRpcMessage[] = [];
         const proc = createMockProcess({
