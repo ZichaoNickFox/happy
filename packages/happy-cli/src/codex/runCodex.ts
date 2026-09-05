@@ -553,7 +553,8 @@ export async function runCodex(opts: {
     // Start Context 
     //
 
-    client = new CodexAppServerClient(sandboxConfig, codexExecutable);
+    // Resolve again between turns so long-lived sessions follow CLI updates.
+    client = new CodexAppServerClient(sandboxConfig);
     const releaseThreadIfIdle = async () => {
         if (shouldExit || messageQueue.size() > 0) {
             return;

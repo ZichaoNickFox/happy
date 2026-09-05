@@ -322,11 +322,20 @@ export class CodexAppServerClient {
     private eventHandler: ((msg: EventMsg) => void) | null = null;
     private approvalHandler: ApprovalHandler | null = null;
 
+    private codexExecutable: string;
+
     constructor(
         sandboxConfig?: SandboxConfig,
-        private readonly codexExecutable = resolveCodexExecutable(),
+        private readonly codexExecutableSource: string | (() => string) = resolveCodexExecutable,
     ) {
         this.sandboxConfig = sandboxConfig;
+        this.codexExecutable = this.resolveExecutable();
+    }
+
+    private resolveExecutable(): string {
+        return typeof this.codexExecutableSource === 'function'
+            ? this.codexExecutableSource()
+            : this.codexExecutableSource;
     }
 
     get threadId(): string | null {
@@ -676,6 +685,7 @@ export class CodexAppServerClient {
 
     async connect(): Promise<void> {
         if (this.connected) return;
+        this.codexExecutable = this.resolveExecutable();
 
         if (!isAppServerAvailable(this.codexExecutable)) {
             throw new Error(
@@ -1357,6 +1367,19 @@ export class CodexAppServerClient {
         }
     }
 
+    private async reconnectIfCodexExecutableChanged(): Promise<void> {
+        if (this.pendingInterrupt) await this.pendingInterrupt;
+        const executable = this.resolveExecutable();
+        if (executable === this.codexExecutable) return;
+
+        logger.warn(`[CodexAppServer] Codex executable changed from ${this.codexExecutable} to ${executable}; reconnecting before the next turn`);
+        const hadThread = this._threadId !== null;
+        const resumed = await this.reconnectAndResumeThread();
+        if (hadThread && !resumed) {
+            throw new Error('Codex executable changed, but the existing thread could not be resumed.');
+        }
+    }
+
     /**
      * Send a turn, transparently replacing a stale app-server after the user
      * logs Codex into another account. The original thread and prompt are
@@ -1372,6 +1395,7 @@ export class CodexAppServerClient {
         extraInputItems?: InputItem[];
         turnTimeoutMs?: number;
     }): Promise<{ aborted: boolean }> {
+        await this.reconnectIfCodexExecutableChanged();
         await this.reconnectIfCodexAuthChanged();
         const first = await this.sendTurnAndWaitOnce(prompt, opts);
         if (!isCodexAuthenticationFailure(first.event)) {

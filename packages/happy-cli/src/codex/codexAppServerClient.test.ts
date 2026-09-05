@@ -237,6 +237,73 @@ describe('CodexAppServerClient sandbox integration', () => {
         await client.disconnect();
     });
 
+    it('upgrades a long-lived session before its next turn and resumes the same thread', async () => {
+        let executable = '/test/codex-old';
+        const requests: MockRpcMessage[][] = [[], []];
+        const processes = requests.map((captured, index) => createMockProcess({
+            pid: 900001 + index,
+            onRequest: (msg, stdout) => {
+                captured.push(msg);
+                if (msg.method === 'thread/start' || msg.method === 'thread/resume') {
+                    setTimeout(() => pushJsonLine(stdout, {
+                        id: msg.id, result: { thread: { id: 'existing-thread' }, model: 'gpt-5.6-sol' },
+                    }), 0);
+                }
+                if (msg.method === 'turn/start') {
+                    setTimeout(() => {
+                        const turnId = `turn-${captured.length}`;
+                        pushJsonLine(stdout, { id: msg.id, result: { turn: { id: turnId } } });
+                        pushJsonLine(stdout, { method: 'codex/event', params: { msg: { type: 'task_started', turn_id: turnId } } });
+                        pushJsonLine(stdout, { method: 'codex/event', params: { msg: { type: 'task_complete', turn_id: turnId } } });
+                    }, 0);
+                }
+            },
+        }));
+        mockSpawn.mockImplementationOnce(() => processes[0]).mockImplementationOnce(() => processes[1]);
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        const client = new CodexAppServerClient(undefined, () => executable);
+        await client.connect();
+        await client.startThread({
+            model: 'gpt-5.6-sol', cwd: '/test/project', approvalPolicy: 'on-request',
+            sandbox: 'workspace-write', developerInstructions: 'Keep these instructions',
+            mcpServers: { example: { command: 'example-mcp' } },
+        });
+        await expect(client.sendTurnAndWait('first')).resolves.toEqual({ aborted: false });
+        expect(mockSpawn).toHaveBeenCalledTimes(1);
+
+        executable = '/test/codex-new';
+        expect(processes[0].kill).not.toHaveBeenCalled();
+        await expect(client.sendTurnAndWait('follow up', {
+            model: 'gpt-6-astra', effort: 'xhigh', approvalPolicy: 'on-request', sandbox: 'workspace-write',
+        })).resolves.toEqual({ aborted: false });
+        expect(mockSpawn.mock.calls.map((call) => call[0])).toEqual(['/test/codex-old', '/test/codex-new']);
+        expect(processes[0].kill).toHaveBeenCalledWith('SIGTERM');
+        expect(requests[0].filter((msg) => msg.method === 'turn/start')).toHaveLength(1);
+        expect(requests[1].find((msg) => msg.method === 'thread/resume')?.params).toMatchObject({
+            threadId: 'existing-thread', cwd: '/test/project', approvalPolicy: 'on-request',
+            sandbox: 'workspace-write', developerInstructions: 'Keep these instructions',
+            config: { mcp_servers: { example: { command: 'example-mcp' } } },
+        });
+        expect(requests[1].find((msg) => msg.method === 'turn/start')?.params).toMatchObject({
+            threadId: 'existing-thread', model: 'gpt-6-astra', effort: 'xhigh',
+            input: [{ type: 'text', text: 'follow up' }], sandboxPolicy: { type: 'workspaceWrite' },
+        });
+        expect(requests[1].filter((msg) => msg.method === 'thread/start')).toHaveLength(0);
+        await expect(client.sendTurnAndWait('one more')).resolves.toEqual({ aborted: false });
+        expect(mockSpawn).toHaveBeenCalledTimes(2);
+        await client.disconnect();
+    });
+
+    it('keeps an explicitly supplied binary across reconnects', async () => {
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        const client = new CodexAppServerClient(undefined, '/test/pinned-codex');
+        await client.connect();
+        await client.disconnect();
+        await client.connect();
+        expect(mockSpawn.mock.calls.map((call) => call[0])).toEqual(['/test/pinned-codex', '/test/pinned-codex']);
+        await client.disconnect();
+    });
+
     it('reconnects and resumes the same thread after forced restart timeout', async () => {
         const firstProcessRequests: MockRpcMessage[] = [];
         const secondProcessRequests: MockRpcMessage[] = [];
